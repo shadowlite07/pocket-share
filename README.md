@@ -116,19 +116,26 @@ Next:
 
 ## Security
 
-The page is locked behind a **6-digit PIN**, set at the top of the script:
+The page is locked behind a **6-digit PIN**, which lives in a `.env` file next
+to the script:
 
-```python
-PIN = "123456"        # CHANGE THIS
+```
+.env
+  PIN=641867
 ```
 
-Both devices ask for it the first time. The correct PIN is exchanged for a
+That file is in `.gitignore` and must never be committed or shared. It is
+created automatically on first run with a **random** PIN, which is printed in
+the console at startup — so there is no guessable default to forget about.
+Edit it any time to change the PIN.
+
+Set `PIN=` (empty) to switch the lock off.
+
+Both devices ask for the PIN the first time. The correct PIN is exchanged for a
 random token that the browser keeps, so you only type it once per device (and
 again after the laptop restarts — sessions are deliberately not saved to
 disk). Guessing is slowed down: 10 wrong tries from one address locks it out
 for a minute.
-
-Set `PIN = ""` to switch the lock off entirely.
 
 Be honest about what this does and does not do:
 

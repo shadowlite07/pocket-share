@@ -58,9 +58,11 @@ BIND_ADDRESS = "0.0.0.0"
 
 DEFAULT_PORT = 8765
 
-# Six digits that unlock the page. CHANGE THIS to something only you know.
-# Leave it as "" to turn the PIN off entirely.
+# Fallback PIN, used only when there is no .env file. A real PIN lives in
+# .env next to this script, which is never committed.
 PIN = "123456"
+
+ENV_FILE = Path(__file__).resolve().parent / ".env"
 
 # How long an unlocked device stays unlocked before asking again.
 SESSION_HOURS = 12
@@ -542,6 +544,67 @@ def identify_sender(client_ip: str, local_ip: str | None) -> str:
 # ============================== NETWORK ==============================
 
 
+def load_env_file(path: Path) -> dict:
+    """
+    Read a tiny .env file. Not a full dotenv implementation - just the part a
+    person actually writes by hand:
+
+        # a comment
+        PIN=123456
+        export DATA_DIR="C:/Some Folder/Shared"
+
+    Quoted values keep their spaces, blank lines and comments are ignored, and
+    a line without '=' is skipped rather than guessed at.
+    """
+    values: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return values
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key:
+            values[key] = value
+    return values
+
+
+def ensure_env_file(path: Path) -> bool:
+    """
+    Create the .env on first run with a random PIN, so the default is never
+    something guessable. Returns True if a file was created.
+    """
+    if path.exists():
+        return False
+    generated = f"{secrets.randbelow(900000) + 100000:06d}"
+    try:
+        path.write_text(
+            "# Teleport Share settings. This file holds your PIN - do not\n"
+            "# commit it, and do not share it.\n"
+            "#\n"
+            "# Set PIN to an empty value to switch the lock off:\n"
+            "#   PIN=\n"
+            "\n"
+            f"PIN={generated}\n",
+            encoding="utf-8")
+    except OSError:
+        return False
+    print(f"  Created {path.name} with a new random PIN: {generated}")
+    print("  Write it down, or change it any time in that file.")
+    sys.stdout.flush()
+    return True
+
+
 def is_link_local(ip: str) -> bool:
     """169.254.x.x - an address Windows auto-assigns when there's no real network."""
     return ip.startswith("169.254.")
@@ -587,7 +650,7 @@ def list_candidate_ips() -> list[str]:
     return found
 
 
-def startup_banner(ip: str | None, port: int) -> None:
+def startup_banner(ip: str | None, port: int, pin_source: str) -> None:
     line = "=" * 64
     print(line)
     print(f"  {APP_NAME} v{VERSION}")
@@ -633,10 +696,16 @@ def startup_banner(ip: str | None, port: int) -> None:
     print("  Press Ctrl+C to stop.")
     if PIN:
         print(line)
-        print(f"  PIN required: {'*' * len(PIN)}   (change PIN at the top of the script)")
-        if PIN == "123456":
-            print("  ! This is the default PIN - change it before using this anywhere")
-            print("    that other people can reach.")
+        print(f"  PIN required ({len(PIN)} characters), read from {pin_source}")
+        if len(PIN) != 6:
+            print(f"  ! That is not six characters. It is still accepted, but a")
+            print(f"    six digit PIN is much harder to guess by accident.")
+        if pin_source != ENV_FILE.name:
+            print("  ! No .env found, so the built-in fallback PIN is in use.")
+            print("    Change it in " + str(ENV_FILE) + " - never commit that file.")
+    else:
+        print(line)
+        print("  PIN is switched off - anyone who reaches this page has full access.")
     print(line)
     sys.stdout.flush()  # so the banner appears even when output is redirected
 
@@ -1412,8 +1481,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global PIN
     fix_console_encoding()
     args = parse_args(argv)
+
+    # A real PIN lives in .env, which is gitignored. The value in this file is
+    # only a fallback for the rare case there is no .env at all.
+    ensure_env_file(ENV_FILE)
+    env = load_env_file(ENV_FILE)
+    pin_source = ENV_FILE.name
+    if "PIN" in env:
+        PIN = env["PIN"].strip()
+        pin_source = ENV_FILE.name
+    else:
+        pin_source = "the fallback inside the script (no PIN in .env)"
 
     store = Store(DATA_DIR)
     store.start()
@@ -1434,7 +1515,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.host not in ("0.0.0.0", "::", ""):
         advertised_ip = args.host  # pinned to one adapter; that IS the address
 
-    startup_banner(advertised_ip, server.server_address[1])
+    startup_banner(advertised_ip, server.server_address[1], pin_source)
     if stale:
         print(f"  (cleaned up {stale} unfinished upload"
               f"{'s' if stale != 1 else ''} from a previous run)")

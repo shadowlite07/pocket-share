@@ -1,3 +1,6 @@
+# Your PIN. Never commit this.
+.env
+
 # Shared data - these are YOUR files (photos, videos, texts).
 # Never commit them.
 SharedFiles/
