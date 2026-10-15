@@ -1,0 +1,21 @@
+# Shared data - these are YOUR files (photos, videos, texts).
+# Never commit them.
+SharedFiles/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store

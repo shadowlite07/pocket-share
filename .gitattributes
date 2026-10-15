@@ -1,0 +1,7 @@
+# Normalise line endings so the repo behaves the same on Windows and Linux.
+* text=auto
+
+*.py  text eol=lf
+*.md  text eol=lf
+*.txt text eol=lf
+*.bat text eol=crlf
