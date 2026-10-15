@@ -78,7 +78,7 @@ MAX_INDEX_ENTRIES = 5000
 # Endpoints with their own tailored log line (uploads and downloads report
 # sender and destination, which is far more useful than "POST /api/upload").
 QUIET_PATHS = {"/api/files", "/api/upload", "/api/download",
-               "/api/texts", "/api/text", "/api/settings"}
+               "/api/texts", "/api/text", "/api/settings", "/api/file"}
 
 # Reserved-for-later settings, so the top of the file stays the single place
 # to look. Unused by step 4; wired up in later steps.
@@ -264,6 +264,69 @@ class Store:
                     existing.update(fields)
                     break
             self._save_locked()
+
+    # ---- deleting ----
+
+    def _drop_entries_locked(self, predicate) -> int:
+        """Remove matching history entries. Call with the lock held."""
+        before = len(self._entries)
+        self._entries = [e for e in self._entries if not predicate(e)]
+        removed = before - len(self._entries)
+        if removed:
+            self._save_locked()
+        return removed
+
+    def delete_file(self, raw: str) -> dict:
+        """
+        Delete one shared file: off the disk and out of the history.
+
+        Goes through the same containment checks as a download, so a crafted
+        request still cannot reach anything outside SharedFiles.
+        """
+        path = self.resolve_for_download(raw)  # raises UploadError if not allowed
+        rel = path.relative_to(self.root.resolve()).as_posix()
+        size = path.stat().st_size
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise UploadError(500, "Could not delete",
+                              f"{raw}: {exc}") from exc
+        with self._lock:
+            self._drop_entries_locked(
+                lambda e: e.get("rel_path") == rel and e.get("type") == "file")
+        return {"rel_path": rel, "size": size}
+
+    def delete_all_files(self) -> dict:
+        """
+        Delete every shared file, at any depth, in one go.
+
+        Messages under Texts/ are deliberately left alone - they are a separate
+        kind of thing and cheap to keep.
+        """
+        root = self.root.resolve()
+        removed, freed = 0, 0
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(".") and d not in self.HIDDEN_DIRS]
+            here = Path(dirpath)
+            for filename in filenames:
+                if filename.startswith("."):
+                    continue
+                path = here / filename
+                rel = path.relative_to(root)
+                if not self._is_listed(rel):
+                    continue
+                try:
+                    if not path.resolve().is_relative_to(root):
+                        continue
+                    freed += path.stat().st_size
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    continue  # a file we cannot remove is not worth aborting for
+        with self._lock:
+            self._drop_entries_locked(lambda e: e.get("type") == "file")
+        return {"removed": removed, "bytes": freed}
 
     # ---- settings ----
 
@@ -687,6 +750,9 @@ class ShareHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._dispatch(send_body=True)
 
+    def do_DELETE(self) -> None:
+        self._dispatch(send_body=True)
+
     def _dispatch(self, send_body: bool) -> None:
         try:
             self._route(send_body)
@@ -727,6 +793,10 @@ class ShareHandler(BaseHTTPRequestHandler):
                              send_body=send_body)
         elif route == "/api/info":
             self._send_json(self._info(), send_body=send_body)
+        elif route == "/api/file" and self.command == "DELETE":
+            self._handle_delete(query)
+        elif route == "/api/files" and self.command == "DELETE":
+            self._handle_delete_all()
         elif route == "/api/texts":
             limit = min(max(int((query.get("limit") or ["20"])[0] or 20), 1), 100)
             self._send_json({"ok": True,
@@ -791,6 +861,19 @@ class ShareHandler(BaseHTTPRequestHandler):
                 sent += len(chunk)
         self.log_message("sent    %-9s to %-15s (%s)",
                          human_size(sent), self.client_address[0], raw)
+
+    def _handle_delete(self, query: dict) -> None:
+        raw = (query.get("path") or [""])[0]
+        gone = self.server.store.delete_file(raw)
+        self.log_message("deleted %-9s (%s)", human_size(gone["size"]),
+                         gone["rel_path"])
+        self._send_json({"ok": True, **gone})
+
+    def _handle_delete_all(self) -> None:
+        result = self.server.store.delete_all_files()
+        self.log_message("deleted ALL files: %d removed, %s freed",
+                         result["removed"], human_size(result["bytes"]))
+        self._send_json({"ok": True, **result})
 
     def _handle_text(self, query: dict) -> None:
         """
@@ -1378,6 +1461,25 @@ PAGE_HTML = r"""
     -webkit-tap-highlight-color: transparent; touch-action: manipulation;
   }
   .dl:active { opacity: .65; }
+  .delbtn {
+    flex: none; background: transparent; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 9px;
+    font: 600 12px inherit; font-family: inherit;
+    padding: 8px 12px; cursor: pointer; margin-left: 6px;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+  }
+  .delbtn:active { opacity: .7; }
+  .delbtn.arm { color: var(--danger); background: var(--danger-soft);
+                border-color: var(--danger); }
+  .delall {
+    margin-top: 12px; background: transparent; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 9px;
+    font: 600 13px inherit; font-family: inherit;
+    padding: 9px 14px; cursor: pointer;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+  }
+  .delall.arm { color: var(--danger); background: var(--danger-soft);
+                border-color: var(--danger); }
   .empty { color: var(--muted); font-size: 14px; margin: 0; }
 
   /* ---- connection ---- */
@@ -1426,6 +1528,7 @@ PAGE_HTML = r"""
     <h2>Files on the laptop</h2>
     <ul class="feed" id="feed"></ul>
     <p class="empty" id="feedEmpty">Nothing shared yet.</p>
+    <button type="button" class="delall" id="delAll" hidden>Delete all files</button>
   </div>
 
   <div class="card">
@@ -1846,11 +1949,55 @@ PAGE_HTML = r"""
     }
   }
 
+  // ---- deleting ----
+  // Deleting is easy to do by accident, especially on a phone. Every delete
+  // asks twice: first tap turns the button red, second tap actually does it.
+  function armOnce(button, action, question) {
+    var armed = false;
+    var timer = null;
+    button.addEventListener('click', function () {
+      if (!armed) {
+        armed = true;
+        button.classList.add('arm');
+        button.textContent = question;
+        timer = setTimeout(function () {
+          armed = false;
+          button.classList.remove('arm');
+          button.textContent = 'Delete';
+        }, 4000);
+        return;
+      }
+      clearTimeout(timer);
+      button.disabled = true;
+      action()
+        .catch(function (err) { alert('Could not delete: ' + err.message); })
+        .then(function () {
+          // The poll will redraw the list without it either way.
+          button.disabled = false;
+        });
+    });
+  }
+
+  var delAll = document.getElementById('delAll');
+  armOnce(delAll, function () {
+    if (!window.confirm(
+      'Delete every shared file?\n\n' +
+      'This removes them from the folder and from the history on both ' +
+      'screens. It cannot be undone.\n\n' +
+      'Saved messages under Texts\\ are kept.')) {
+      return Promise.reject(new Error('cancelled'));
+    }
+    return fetch('/api/files', { method: 'DELETE' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) { if (!d.ok) throw new Error(d.error || 'failed'); });
+  }, 'Really delete all?');
+
   function renderFeed(items) {
     var signature = signatureOf(items);
     if (signature === lastSignature) return;
     lastSignature = signature;
 
+    delAll.hidden = items.length === 0;
     feedEmpty.style.display = items.length ? 'none' : 'block';
     feed.textContent = '';
     items.forEach(function (it) {
@@ -1883,8 +2030,22 @@ PAGE_HTML = r"""
       link.textContent = 'Download';
       link.href = '/api/download?path=' + encodeURIComponent(it.rel_path);
       link.setAttribute('download', it.name);
+
+      var del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'delbtn';
+      del.textContent = 'Delete';
+      del.setAttribute('aria-label', 'Delete ' + it.name);
+      armOnce(del, function () {
+        return fetch('/api/file?path=' + encodeURIComponent(it.rel_path),
+                     { method: 'DELETE' })
+          .then(function (r) { return r.json(); })
+          .then(function (d) { if (!d.ok) throw new Error(d.error || 'failed'); });
+      }, 'Really delete?');
+
       bot.appendChild(meta);
       bot.appendChild(link);
+      bot.appendChild(del);
 
       li.appendChild(top);
       li.appendChild(bot);
