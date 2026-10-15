@@ -62,6 +62,13 @@ DATA_DIR = Path(__file__).resolve().parent / "SharedFiles"
 # into memory, so a 4 GB video costs the same RAM as a 4 KB text file.
 CHUNK_SIZE = 256 * 1024
 
+# Copy text arriving from the phone straight to the Windows clipboard.
+CLIPBOARD_AUTOCOPY_DEFAULT = True
+
+# Longest single message accepted, as characters and as a request body.
+MAX_TEXT_CHARS = 20_000
+MAX_TEXT_BYTES = 200_000
+
 # Longest filename we will store; the extension is preserved when trimming.
 MAX_NAME_LEN = 120
 
@@ -70,14 +77,13 @@ MAX_INDEX_ENTRIES = 5000
 
 # Endpoints with their own tailored log line (uploads and downloads report
 # sender and destination, which is far more useful than "POST /api/upload").
-QUIET_PATHS = {"/api/files", "/api/upload", "/api/download"}
+QUIET_PATHS = {"/api/files", "/api/upload", "/api/download",
+               "/api/texts", "/api/text", "/api/settings"}
 
 # Reserved-for-later settings, so the top of the file stays the single place
-# to look. Unused by step 2; wired up in later steps.
+# to look. Unused by step 4; wired up in later steps.
 # PIN = "123456"                        # step 7
-# CLIPBOARD_AUTOCOPY_DEFAULT = True     # step 4
 # HISTORY_LIMIT = 100                   # step 6
-# POLL_SECONDS = 1.5                    # step 6
 
 # ===================================================================
 
@@ -187,9 +193,11 @@ class Store:
         self.texts = root / "Texts"
         self.tmp = root / "_inbox_tmp"  # partial uploads; never listed
         self.index_path = root / ".teleport_index.json"
+        self.config_path = root / ".teleport_config.json"
         self._lock = threading.Lock()
         self._entries: list[dict] = []
         self._next_id = 1
+        self.config: dict = {}
 
     # ---- startup ----
 
@@ -198,6 +206,12 @@ class Store:
                        self.texts, self.tmp):
             folder.mkdir(parents=True, exist_ok=True)
         self._load_index()
+        try:
+            saved = json.loads(self.config_path.read_text(encoding="utf-8"))
+            if isinstance(saved, dict):
+                self.config = saved
+        except (OSError, ValueError):
+            pass  # no config yet: defaults apply
 
     def discard_partials(self) -> int:
         """Delete half-finished uploads left behind by a crash or hard exit."""
@@ -241,6 +255,51 @@ class Store:
             del self._entries[: len(self._entries) - MAX_INDEX_ENTRIES]
         self._save_locked()
         return entry
+
+    def annotate(self, entry: dict, **fields) -> None:
+        """Attach extra detail to an entry already saved (e.g. clipboard state)."""
+        with self._lock:
+            for existing in self._entries:
+                if existing.get("id") == entry.get("id"):
+                    existing.update(fields)
+                    break
+            self._save_locked()
+
+    # ---- settings ----
+
+    def get_setting(self, key: str, default):
+        with self._lock:
+            return self.config.get(key, default)
+
+    def set_setting(self, key: str, value) -> None:
+        with self._lock:
+            self.config[key] = value
+            tmp = self.config_path.with_name(self.config_path.name + ".tmp")
+            tmp.write_text(json.dumps(self.config, indent=1), encoding="utf-8")
+            os.replace(tmp, self.config_path)
+
+    # ---- texts ----
+
+    def record_text(self, sender: str, text: str) -> dict:
+        """Save a message as a timestamped .txt and note it in the history."""
+        with self._lock:
+            name = f"{stamp_compact()}_from-{sender}.txt"
+            path = unique_path(self.texts, name)
+            path.write_text(text, encoding="utf-8")
+            return self._record_locked({
+                "type": "text",
+                "sender": sender,
+                "text": text,
+                "original_name": path.name,
+                "stored_name": path.name,
+                "rel_path": path.relative_to(self.root).as_posix(),
+            })
+
+    def recent_texts(self, limit: int = 20) -> list[dict]:
+        """Newest-first messages, for the feed on both pages."""
+        with self._lock:
+            entries = [e for e in self._entries if e.get("type") == "text"]
+            return list(reversed(entries[-limit:]))
 
     # ---- files ----
 
@@ -474,6 +533,107 @@ def startup_banner(ip: str | None, port: int) -> None:
     sys.stdout.flush()  # so the banner appears even when output is redirected
 
 
+# ============================= CLIPBOARD ==============================
+# Windows only, and done through ctypes rather than tkinter (which may be
+# missing from a Python build and would pop a window) or pyperclip (pip).
+
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+
+def copy_to_clipboard(text: str) -> tuple[bool, str]:
+    """
+    Put text on the Windows clipboard.
+
+    Returns (ok, reason_if_not). Another program can hold the clipboard open
+    for a moment, so opening is retried a few times before giving up.
+    """
+    if os.name != "nt":
+        return False, "Clipboard is only wired up on Windows."
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    # These default to 32-bit ints, which silently truncates pointers on a
+    # 64-bit process - so every pointer-returning call needs restype set.
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+
+    opened = False
+    for _ in range(10):
+        if user32.OpenClipboard(None):
+            opened = True
+            break
+        time.sleep(0.05)  # another app is using it; almost always momentary
+    if not opened:
+        return False, "Another program is holding the clipboard open."
+
+    try:
+        if not user32.EmptyClipboard():
+            return False, "Could not clear the clipboard."
+        buffer = ctypes.create_unicode_buffer(text)
+        size = ctypes.sizeof(buffer)
+        handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
+        if not handle:
+            return False, "Out of memory."
+        locked = kernel32.GlobalLock(handle)
+        if not locked:
+            kernel32.GlobalFree(handle)
+            return False, "Could not lock clipboard memory."
+        try:
+            ctypes.memmove(locked, buffer, size)
+        finally:
+            kernel32.GlobalUnlock(handle)
+        if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+            kernel32.GlobalFree(handle)
+            return False, "Windows refused the clipboard data."
+        # Ownership passed to the system - deliberately not freed.
+        return True, ""
+    finally:
+        user32.CloseClipboard()
+
+
+def read_clipboard() -> str:
+    """Read the clipboard back. Used by the tests to prove the copy worked."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    # Without an explicit restype this returns a 32-bit int and truncates the
+    # handle on a 64-bit process, so the clipboard always reads back empty.
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+
+    if not user32.OpenClipboard(None):
+        return ""
+    try:
+        handle = user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return ""
+        locked = kernel32.GlobalLock(handle)
+        if not locked:
+            return ""
+        try:
+            return ctypes.c_wchar_p(locked).value or ""
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
 # ============================== SERVER ==============================
 
 
@@ -567,6 +727,15 @@ class ShareHandler(BaseHTTPRequestHandler):
                              send_body=send_body)
         elif route == "/api/info":
             self._send_json(self._info(), send_body=send_body)
+        elif route == "/api/texts":
+            limit = min(max(int((query.get("limit") or ["20"])[0] or 20), 1), 100)
+            self._send_json({"ok": True,
+                             "texts": self.server.store.recent_texts(limit)},
+                            send_body=send_body)
+        elif route == "/api/settings":
+            self._handle_settings()
+        elif route == "/api/text":
+            self._handle_text(query)
         elif route == "/api/files":
             limit = min(max(int((query.get("limit") or ["200"])[0] or 200), 1), 500)
             self._send_json({
@@ -622,6 +791,102 @@ class ShareHandler(BaseHTTPRequestHandler):
                 sent += len(chunk)
         self.log_message("sent    %-9s to %-15s (%s)",
                          human_size(sent), self.client_address[0], raw)
+
+    def _handle_text(self, query: dict) -> None:
+        """
+        A typed message: saved as a timestamped .txt, added to the history, and
+        - for text arriving from the phone - optionally copied to the Windows
+        clipboard so it can be pasted straight into whatever is on screen.
+        """
+        length_header = self.headers.get("Content-Length")
+        if not length_header:
+            raise UploadError(411, "Missing Content-Length",
+                              "Send the message as a JSON body.")
+        try:
+            length = int(length_header)
+        except ValueError:
+            raise UploadError(400, "Bad Content-Length",
+                              f"Could not read Content-Length: {length_header!r}") from None
+        if length <= 0:
+            raise UploadError(400, "Empty message", "Nothing was sent.")
+        if length > MAX_TEXT_BYTES:
+            raise UploadError(413, "Message too long",
+                              f"Keep it under {MAX_TEXT_CHARS} characters.")
+
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise UploadError(400, "Bad message",
+                              f"Body must be JSON like {{\"text\": \"...\"}}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise UploadError(400, "Bad message", "Body must be a JSON object.")
+
+        text = payload.get("text")
+        if not isinstance(text, str):
+            raise UploadError(400, "Bad message", "The 'text' field must be a string.")
+        text = text.strip()
+        if not text:
+            raise UploadError(400, "Empty message", "Type something first.")
+        if len(text) > MAX_TEXT_CHARS:
+            raise UploadError(413, "Message too long",
+                              f"Keep it under {MAX_TEXT_CHARS} characters "
+                              f"(this one is {len(text)}).")
+
+        sender = str(payload.get("from") or (query.get("from") or [""])[0]).lower()
+        if sender not in ("phone", "laptop"):
+            sender = identify_sender(self.client_address[0],
+                                     getattr(self.server, "local_ip", None))
+
+        entry = self.server.store.record_text(sender, text)
+
+        clipboard = {"copied": False, "detail": "Not applicable."}
+        want_clip = self.server.store.get_setting("clipboard_autocopy",
+                                                  CLIPBOARD_AUTOCOPY_DEFAULT)
+        if sender == "phone" and want_clip:
+            copied, why = copy_to_clipboard(text)
+            clipboard = {"copied": copied,
+                         "detail": "" if copied else why}
+        elif sender == "phone":
+            clipboard = {"copied": False,
+                         "detail": "Clipboard auto-copy is switched off."}
+
+        # Remember whether it reached the clipboard, so both pages can show it.
+        self.server.store.annotate(entry, clipboard=clipboard)
+
+        self.log_message("text    from %-6s (%d chars)%s -> %s",
+                         sender.upper(), len(text),
+                         "  [copied to clipboard]" if clipboard["copied"] else "",
+                         entry["rel_path"])
+        self._send_json({"ok": True, **entry, "clipboard": clipboard})
+
+    def _handle_settings(self) -> None:
+        """Read or change the little settings the page can toggle."""
+        store = self.server.store
+        if self.command == "GET":
+            self._send_json({
+                "ok": True,
+                "clipboard_autocopy": store.get_setting("clipboard_autocopy",
+                                                        CLIPBOARD_AUTOCOPY_DEFAULT),
+            })
+            return
+
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8")) \
+                if length else {}
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise UploadError(400, "Bad settings", str(exc)) from exc
+        if not isinstance(payload, dict):
+            raise UploadError(400, "Bad settings", "Body must be a JSON object.")
+
+        if "clipboard_autocopy" in payload:
+            store.set_setting("clipboard_autocopy",
+                              bool(payload["clipboard_autocopy"]))
+        self._send_json({
+            "ok": True,
+            "clipboard_autocopy": store.get_setting("clipboard_autocopy",
+                                                    CLIPBOARD_AUTOCOPY_DEFAULT),
+        })
 
     def _handle_upload(self, query: dict) -> None:
         """
@@ -937,12 +1202,73 @@ PAGE_HTML = r"""
   .wrap { max-width: 560px; margin: 0 auto; }
   header { display: flex; align-items: center; gap: 10px; margin: 4px 0 18px; }
   h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
-  .badge {
-    margin-left: auto; background: var(--accent-soft); color: var(--accent);
-    font-size: 12px; font-weight: 600; padding: 4px 10px;
-    border-radius: 999px; white-space: nowrap;
+  .iconbtn {
+    margin-left: auto; width: 40px; height: 40px; flex: none;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 19px; line-height: 1; cursor: pointer;
+    background: var(--accent-soft); color: var(--accent);
+    border: 0; border-radius: 11px;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
   }
+  .iconbtn:active { transform: scale(.94); }
+  .iconbtn[disabled] { opacity: .45; cursor: default; }
+  .badge { margin-left: 8px; font-size: 12px; font-weight: 600; padding: 4px 10px;
+    border-radius: 999px; white-space: nowrap;
+    background: var(--accent-soft); color: var(--accent); }
   .badge.err { background: var(--danger-soft); color: var(--danger); }
+
+  /* ---- text modal ---- */
+  dialog {
+    border: 0; border-radius: 16px; padding: 0; width: min(520px, calc(100vw - 28px));
+    background: var(--card); color: var(--text);
+    box-shadow: 0 18px 50px rgba(0,0,0,.32);
+  }
+  dialog::backdrop { background: rgba(0,0,0,.45); }
+  .dlg { padding: 18px; }
+  .dlg h3 { margin: 0 0 4px; font-size: 17px; }
+  .dlg .hint { margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+  #textInput {
+    width: 100%; resize: vertical; min-height: 108px;
+    font: 15px/1.45 inherit; font-family: inherit; color: var(--text);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+    padding: 11px 12px;
+  }
+  #textInput:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .dlgrow {
+    display: flex; align-items: center; gap: 10px; margin-top: 14px;
+  }
+  .dlgrow .spacer { flex: 1; }
+  .btn {
+    border: 0; border-radius: 10px; padding: 11px 18px;
+    font: 600 14px inherit; font-family: inherit; cursor: pointer;
+    background: var(--accent); color: #fff;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+  }
+  .btn:active { opacity: .8; }
+  .btn.ghost { background: transparent; color: var(--muted); }
+  .btn[disabled] { opacity: .5; }
+
+  /* ---- message feed ---- */
+  ul.msgs { list-style: none; margin: 0; padding: 0; }
+  ul.msgs li {
+    padding: 11px 0; border-top: 1px solid var(--line);
+  }
+  ul.msgs li:first-child { border-top: 0; }
+  ul.msgs li.fresh { animation: flash 1.8s ease-out; }
+  ul.msgs .msgtop { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+  ul.msgs .msgbody {
+    font-size: 14.5px; white-space: pre-wrap; word-break: break-word;
+  }
+  ul.msgs .copied {
+    font-size: 11px; font-weight: 600; color: var(--accent);
+    background: var(--accent-soft); padding: 2px 6px; border-radius: 4px;
+  }
+  .switch {
+    display: flex; align-items: center; gap: 9px; margin: 0 0 12px;
+    padding: 10px 12px; border-radius: 10px; background: var(--bg);
+    font-size: 13px; color: var(--muted);
+  }
+  .switch input { width: 17px; height: 17px; accent-color: var(--accent); flex: none; }
   .card {
     background: var(--card); border: 1px solid var(--line);
     border-radius: 14px; padding: 16px; margin-bottom: 14px;
@@ -1056,8 +1382,19 @@ PAGE_HTML = r"""
 <div class="wrap">
   <header>
     <h1>Teleport Share</h1>
+    <button class="iconbtn" id="textBtn" aria-label="Send text" title="Send text">&#9998;</button>
     <span class="badge" id="status">connecting&hellip;</span>
   </header>
+
+  <div class="card">
+    <h2>Messages</h2>
+    <label class="switch" id="clipRow" hidden>
+      <input type="checkbox" id="clipToggle">
+      <span>Copy text from the phone to the Windows clipboard</span>
+    </label>
+    <ul class="msgs" id="msgs"></ul>
+    <p class="empty" id="msgsEmpty">No messages yet.</p>
+  </div>
 
   <div class="card">
     <h2>Send files</h2>
@@ -1089,6 +1426,19 @@ PAGE_HTML = r"""
 
   <p class="foot">Saved in <code id="dir">&hellip;</code></p>
 </div>
+
+<dialog id="textDlg">
+  <div class="dlg">
+    <h3>Send text</h3>
+    <p class="hint" id="textDest">It appears on the other screen straight away.</p>
+    <textarea id="textInput" placeholder="Type a message..."></textarea>
+    <div class="dlgrow">
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="textCancel">Cancel</button>
+      <button type="button" class="btn" id="textSend">Send</button>
+    </div>
+  </div>
+</dialog>
 
 <script>
 (function () {
@@ -1245,6 +1595,124 @@ PAGE_HTML = r"""
     clearBtn.disabled = true;
   });
 
+  // ---- text: icon button -> modal -> send ----
+  var textBtn = document.getElementById('textBtn');
+  var dlg = document.getElementById('textDlg');
+  var textInput = document.getElementById('textInput');
+  var textSend = document.getElementById('textSend');
+  var textCancel = document.getElementById('textCancel');
+  var textDest = document.getElementById('textDest');
+  var msgs = document.getElementById('msgs');
+  var msgsEmpty = document.getElementById('msgsEmpty');
+  var lastMsgSig = '';
+  var seenMsgs = {};
+  var clipRow = document.getElementById('clipRow');
+  var clipToggle = document.getElementById('clipToggle');
+
+  textBtn.addEventListener('click', function () {
+    textDest.textContent = isPhone
+      ? 'It appears on the laptop straight away.'
+      : 'It appears on the phone straight away.';
+    dlg.showModal();
+    textInput.focus();
+  });
+  textCancel.addEventListener('click', function () { dlg.close(); });
+  dlg.addEventListener('close', function () { textInput.value = ''; });
+
+  function sendText() {
+    var text = textInput.value.trim();
+    if (!text) return;
+    textSend.disabled = true;
+    fetch('/api/text', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: text })
+    })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+      .then(function (res) {
+        if (!res.ok || !res.d.ok) throw new Error(res.d.error || 'send failed');
+        textInput.value = '';
+        dlg.close();
+      })
+      .catch(function (err) {
+        textDest.textContent = 'Could not send: ' + err.message;
+      })
+      .then(function () { textSend.disabled = false; });
+  }
+
+  textSend.addEventListener('click', sendText);
+  textInput.addEventListener('keydown', function (e) {
+    // Enter sends, Ctrl+Enter makes a new line - the usual chat convention.
+    if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey) {
+      e.preventDefault();
+      sendText();
+    }
+  });
+
+  clipToggle.addEventListener('change', function () {
+    fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clipboard_autocopy: clipToggle.checked })
+    }).catch(function () { clipToggle.checked = !clipToggle.checked; });
+  });
+
+  function loadSettings() {
+    return fetch('/api/settings')
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        // Only the laptop has a Windows clipboard worth filling.
+        clipRow.hidden = !isPhone;
+        clipToggle.checked = !!d.clipboard_autocopy;
+      });
+  }
+
+  function renderMsgs(items) {
+    var sig = items.map(function (t) { return t.id; }).join(',');
+    if (sig === lastMsgSig) return;
+    lastMsgSig = sig;
+
+    msgsEmpty.style.display = items.length ? 'none' : 'block';
+    msgs.textContent = '';
+    items.forEach(function (t) {
+      var li = document.createElement('li');
+      if (seenMsgs[t.id]) li.className = 'fresh';
+      seenMsgs[t.id] = true;
+
+      var top = document.createElement('div');
+      top.className = 'msgtop';
+      var tag = document.createElement('span');
+      tag.className = 'fdir ' + t.sender;
+      tag.textContent = t.sender === 'phone' ? 'PHONE' : 'LAPTOP';
+      var when = document.createElement('span');
+      when.className = 'feedsize';
+      when.textContent = clockOf(t.ts);
+      top.appendChild(tag);
+      top.appendChild(when);
+      if (t.clipboard && t.clipboard.copied) {
+        var cp = document.createElement('span');
+        cp.className = 'copied';
+        cp.textContent = 'pasted-ready';
+        top.appendChild(cp);
+      }
+
+      var body = document.createElement('div');
+      body.className = 'msgbody';    // textContent, so text is never markup
+      body.textContent = t.text;
+
+      li.appendChild(top);
+      li.appendChild(body);
+      msgs.appendChild(li);
+    });
+  }
+
+  function pollMsgs() {
+    fetch('/api/texts?limit=20')
+      .then(function (r) { return r.json(); })
+      .then(function (d) { if (d.ok) renderMsgs(d.texts || []); })
+      .catch(function () {});
+  }
+
   // ---- files on the laptop: polled so an upload shows up on its own ----
   var feed = document.getElementById('feed');
   var feedEmpty = document.getElementById('feedEmpty');
@@ -1391,8 +1859,13 @@ PAGE_HTML = r"""
       .catch(function () { setStatus('disconnected', true); });
   }
 
-  poll();
-  setInterval(poll, 2000);
+  function pollAll() {
+    poll();
+    pollMsgs();
+  }
+
+  pollAll();
+  setInterval(pollAll, 2000);
 
   // ---- who am I, and where do files go ----
   fetch('/api/info')
@@ -1400,6 +1873,8 @@ PAGE_HTML = r"""
     .then(function (d) {
       setStatus('connected', false);
       var who = d.sender === 'laptop' ? 'Laptop' : 'Phone';
+      isPhone = (d.sender !== 'laptop');
+      loadSettings();
       document.getElementById('who').textContent = who;
       document.getElementById('dest').textContent =
         'SharedFiles/' + (d.sender === 'laptop' ? 'FromLaptop' : 'FromPhone');

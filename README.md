@@ -105,13 +105,33 @@ Built and working:
 - [x] Files the laptop shares are started automatically on the phone — the
       phone fetches them without you finding them in a list (Android Chrome
       still asks you to confirm with **Keep**, see below)
+- [x] Send text from the phone — an icon button opens a box, and the message
+      lands on the laptop page and on your Windows clipboard
 
 Next:
 
-- [ ] Send text in both directions (with optional auto-copy to the Windows
-      clipboard, and a Copy button on the phone)
+- [ ] Copy button for text on the phone (laptop → phone text)
 - [ ] Merged live history of files and text on both pages
 - [ ] Optional PIN, QR code on the console, launcher script
+
+## Text
+
+Tap the ✎ button in the header to type a message. On the phone, what you send
+shows up on the laptop page within a couple of seconds **and is copied to the
+Windows clipboard**, so you can paste it straight into whatever you were
+working in with Ctrl+V. Messages that made it into the clipboard are tagged
+*past ready* in the history.
+
+The clipboard switch only appears on the laptop page, because there is no
+Windows clipboard on the phone. Turn it off and the message is still saved and
+displayed — it just no longer takes over your clipboard.
+
+Every message is also written to `SharedFiles/Texts/` as
+`YYYYmmdd-HHMMSS_from-phone.txt`, so nothing is lost if you want to grep
+through old notes later.
+
+The clipboard is written through `ctypes` and Windows' own API — no `pip`
+install, no hidden tkinter window popping up, and no dependency on pyperclip.
 
 ## How a file actually reaches the phone
 
