@@ -118,3 +118,7 @@ This is a tool for your own hotspot, and it is honest about what that means:
 - There is no HTTPS, because Python's standard library can use a certificate
   but cannot generate one.
 - Lock your hotspot with a password if the network is not just you.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
