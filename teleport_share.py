@@ -328,6 +328,26 @@ class Store:
             self._drop_entries_locked(lambda e: e.get("type") == "file")
         return {"removed": removed, "bytes": freed}
 
+    def delete_all_texts(self) -> dict:
+        """
+        Clear every saved message: the .txt files under Texts/ and the
+        matching history entries. There is no undo.
+        """
+        removed, freed = 0, 0
+        if self.texts.is_dir():
+            for path in self.texts.rglob("*"):
+                if not path.is_file() or path.suffix.lower() != ".txt":
+                    continue
+                try:
+                    freed += path.stat().st_size
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    continue
+        with self._lock:
+            self._drop_entries_locked(lambda e: e.get("type") == "text")
+        return {"removed": removed, "bytes": freed}
+
     # ---- settings ----
 
     def get_setting(self, key: str, default):
@@ -797,6 +817,8 @@ class ShareHandler(BaseHTTPRequestHandler):
             self._handle_delete(query)
         elif route == "/api/files" and self.command == "DELETE":
             self._handle_delete_all()
+        elif route == "/api/texts" and self.command == "DELETE":
+            self._handle_clear_texts()
         elif route == "/api/texts":
             limit = min(max(int((query.get("limit") or ["20"])[0] or 20), 1), 100)
             self._send_json({"ok": True,
@@ -861,6 +883,12 @@ class ShareHandler(BaseHTTPRequestHandler):
                 sent += len(chunk)
         self.log_message("sent    %-9s to %-15s (%s)",
                          human_size(sent), self.client_address[0], raw)
+
+    def _handle_clear_texts(self) -> None:
+        result = self.server.store.delete_all_texts()
+        self.log_message("cleared ALL messages: %d removed, %s freed",
+                         result["removed"], human_size(result["bytes"]))
+        self._send_json({"ok": True, **result})
 
     def _handle_delete(self, query: dict) -> None:
         raw = (query.get("path") or [""])[0]
@@ -1509,6 +1537,7 @@ PAGE_HTML = r"""
     </label>
     <ul class="msgs" id="msgs"></ul>
     <p class="empty" id="msgsEmpty">No messages yet.</p>
+    <button type="button" class="delall" id="clearMsgs" hidden>Clear all messages</button>
   </div>
 
   <div class="card">
@@ -1724,6 +1753,7 @@ PAGE_HTML = r"""
   var seenMsgs = {};
   var clipRow = document.getElementById('clipRow');
   var clipToggle = document.getElementById('clipToggle');
+  var clearMsgs = document.getElementById('clearMsgs');
 
   textBtn.addEventListener('click', function () {
     textDest.textContent = isPhone
@@ -1813,12 +1843,27 @@ PAGE_HTML = r"""
     return Promise.resolve(legacyCopy(text));
   }
 
+  var clearMsgs = document.getElementById('clearMsgs');
+  armOnce(clearMsgs, function () {
+    if (!window.confirm(
+      'Clear all messages?\n\n' +
+      'This deletes every saved .txt under Texts\\ and empties the message ' +
+      'history on both screens. Shared files are not touched.\n\n' +
+      'This cannot be undone.')) {
+      return Promise.reject(new Error('cancelled'));
+    }
+    return fetch('/api/texts', { method: 'DELETE' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) { if (!d.ok) throw new Error(d.error || 'failed'); });
+  }, 'Really clear?', 'Clear all messages');
+
   function renderMsgs(items) {
     var sig = items.map(function (t) { return t.id; }).join(',');
     if (sig === lastMsgSig) return;
     lastMsgSig = sig;
 
     msgsEmpty.style.display = items.length ? 'none' : 'block';
+    clearMsgs.hidden = items.length === 0;
     msgs.textContent = '';
     items.forEach(function (t) {
       var li = document.createElement('li');
@@ -1952,9 +1997,10 @@ PAGE_HTML = r"""
   // ---- deleting ----
   // Deleting is easy to do by accident, especially on a phone. Every delete
   // asks twice: first tap turns the button red, second tap actually does it.
-  function armOnce(button, action, question) {
+  function armOnce(button, action, question, resetLabel) {
     var armed = false;
     var timer = null;
+    resetLabel = resetLabel || 'Delete';
     button.addEventListener('click', function () {
       if (!armed) {
         armed = true;
@@ -1963,7 +2009,7 @@ PAGE_HTML = r"""
         timer = setTimeout(function () {
           armed = false;
           button.classList.remove('arm');
-          button.textContent = 'Delete';
+          button.textContent = resetLabel;
         }, 4000);
         return;
       }

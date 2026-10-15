@@ -119,7 +119,8 @@ Next:
 Each file has a **Delete** button. You have to tap it twice — the first tap
 turns it red and asks *Really delete?*, and it disarms itself after 4 seconds
 if you change your mind. **Delete all files** at the bottom works the same way
-and then asks once more.
+and then asks once more. **Clear all messages** in the Messages card empties
+`saved messages` the same way, and leaves shared files alone.
 
 Deletion goes through the same checks as a download, so a crafted request
 cannot reach outside `SharedFiles\`. Internal bookkeeping files are never
