@@ -1480,6 +1480,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def build_server(host: str, port: int) -> tuple[ShareServer, str, Store, int]:
+    """
+    Create everything a running server needs.
+
+    Shared by the command line and the GUI so the two cannot drift apart.
+    Returns (server, local_ip, store, stale_uploads_cleaned).
+    """
+    store = Store(DATA_DIR)
+    store.start()
+    stale = store.discard_partials()
+
+    server, detected_ip = start_server(host, port)
+    server.store = store
+    server.local_ip = detected_ip
+    server.sessions = Sessions()
+    server.login_guard = LoginGuard()
+    return server, detected_ip, store, stale
+
+
 def main(argv: list[str] | None = None) -> int:
     global PIN
     fix_console_encoding()
@@ -1496,20 +1515,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         pin_source = "the fallback inside the script (no PIN in .env)"
 
-    store = Store(DATA_DIR)
-    store.start()
-    stale = store.discard_partials()
-
     try:
-        server, detected_ip = start_server(args.host, args.port)
+        server, detected_ip, store, stale = build_server(args.host, args.port)
     except OSError as exc:
         print(f"\nERROR: {exc}\n", file=sys.stderr)
         return 1
-
-    server.store = store
-    server.local_ip = detected_ip
-    server.sessions = Sessions()
-    server.login_guard = LoginGuard()
 
     advertised_ip = args.ip or detected_ip
     if args.host not in ("0.0.0.0", "::", ""):
@@ -2563,7 +2573,22 @@ PAGE_HTML = r"""
 
 
 
-# Entry point must stay last: main() serves PAGE_HTML, so the page string has
-# to exist before the first request can arrive.
+def load_settings() -> dict:
+    """
+    Apply .env the same way main() does. The GUI has no argv, so it needs the
+    PIN set up before anything else looks at it.
+    """
+    ts_ensure = ensure_env_file(ENV_FILE)
+    env = load_env_file(ENV_FILE)
+    if "PIN" in env:
+        globals()["PIN"] = env["PIN"].strip()
+        return {"source": ENV_FILE.name, "generated": ts_ensure}
+    return {"source": "the fallback inside the script (no PIN in .env)",
+            "generated": ts_ensure}
+
+
+# ============================== ENTRY POINT ==============================
+# main() serves PAGE_HTML, so the page string has to exist before the first
+# request can arrive - which is why this stays at the very bottom of the file.
 if __name__ == "__main__":
     sys.exit(main())

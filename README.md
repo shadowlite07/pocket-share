@@ -23,6 +23,18 @@ Python 3.9+ on Windows. Nothing else.
 
 ## Run it
 
+**As an app (Windows):**
+
+```
+python pocket_share.py
+```
+
+A small window starts the server for you, shows both addresses with Copy and
+Open buttons, reveals the PIN on demand, opens the data folder, and shows live
+activity so you can see transfers happening without watching a console.
+
+**As a command line tool:**
+
 ```
 python teleport_share.py
 ```
@@ -37,7 +49,7 @@ It prints the address to open on each device:
       http://192.168.181.50:8765
 ```
 
-Then open the same page on both. Useful flags:
+Useful flags:
 
 ```
 python teleport_share.py --port 9000     # different port
@@ -252,6 +264,19 @@ This is a tool for your own hotspot, and it is honest about what that means:
 - There is no HTTPS, because Python's standard library can use a certificate
   but cannot generate one.
 - Lock your hotspot with a password if the network is not just you.
+
+## Android
+
+The Python server runs unchanged on Android — the clipboard is the only
+Windows-specific part and it is already guarded. If you want a native app,
+**[ANDROID_APP_PROMPT.md](ANDROID_APP_PROMPT.md)** is a ready-made brief for an
+AI coding tool, covering the stack (Chaquopy + WebView, so the script is
+embedded rather than rewritten) and the four Android traps that break this
+particular app.
+
+A quick way to try it before writing any app: run the script in **Termux**
+(F-Droid, not the Play Store), `pkg install python`, then
+`python teleport_share.py`.
 
 ## License
 
