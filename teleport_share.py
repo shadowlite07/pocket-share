@@ -1263,6 +1263,19 @@ PAGE_HTML = r"""
     font-size: 11px; font-weight: 600; color: var(--accent);
     background: var(--accent-soft); padding: 2px 6px; border-radius: 4px;
   }
+  .copybtn {
+    margin-left: auto; flex: none;
+    background: var(--bg); color: var(--muted);
+    border: 1px solid var(--line); border-radius: 8px;
+    font: 600 12px inherit; font-family: inherit;
+    padding: 5px 11px; cursor: pointer;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+  }
+  .copybtn:active { opacity: .7; }
+  .copybtn.ok { color: var(--accent); background: var(--accent-soft);
+                border-color: var(--accent); }
+  .copybtn.bad { color: var(--danger); background: var(--danger-soft);
+                 border-color: var(--danger); }
   .switch {
     display: flex; align-items: center; gap: 9px; margin: 0 0 12px;
     padding: 10px 12px; border-radius: 10px; background: var(--bg);
@@ -1667,6 +1680,36 @@ PAGE_HTML = r"""
       });
   }
 
+  // ---- copying text on this device ----
+  // navigator.clipboard only works in a secure context. localhost counts as
+  // one, but http://192.168.x.x on the phone does not - so there has to be a
+  // fallback that works over plain HTTP, using a throwaway textarea.
+  function legacyCopy(text) {
+    var area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;' +
+      'padding:0;border:none;outline:none;box-shadow:none;background:transparent;opacity:0';
+    document.body.appendChild(area);
+    area.focus();
+    area.select();
+    // iOS needs an explicit range, or the selection is empty and nothing copies.
+    try { area.setSelectionRange(0, text.length); } catch (err) {}
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+    document.body.removeChild(area);
+    return ok;
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text)
+        .then(function () { return true; })
+        .catch(function () { return legacyCopy(text); });
+    }
+    return Promise.resolve(legacyCopy(text));
+  }
+
   function renderMsgs(items) {
     var sig = items.map(function (t) { return t.id; }).join(',');
     if (sig === lastMsgSig) return;
@@ -1695,6 +1738,25 @@ PAGE_HTML = r"""
         cp.textContent = 'pasted-ready';
         top.appendChild(cp);
       }
+
+      var copy = document.createElement('button');
+      copy.type = 'button';
+      copy.className = 'copybtn';
+      copy.textContent = 'Copy';
+      copy.addEventListener('click', function () {
+        var button = this;
+        button.disabled = true;
+        copyText(t.text).then(function (ok) {
+          button.disabled = false;
+          button.textContent = ok ? 'Copied' : 'Press & hold';
+          button.classList.add(ok ? 'ok' : 'bad');
+          setTimeout(function () {
+            button.textContent = 'Copy';
+            button.classList.remove('ok', 'bad');
+          }, 1800);
+        });
+      });
+      top.appendChild(copy);
 
       var body = document.createElement('div');
       body.className = 'msgbody';    // textContent, so text is never markup

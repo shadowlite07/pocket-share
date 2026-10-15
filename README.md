@@ -107,31 +107,47 @@ Built and working:
       still asks you to confirm with **Keep**, see below)
 - [x] Send text from the phone — an icon button opens a box, and the message
       lands on the laptop page and on your Windows clipboard
+- [x] Send text from the laptop, with a **Copy** button on the phone
 
 Next:
 
-- [ ] Copy button for text on the phone (laptop → phone text)
 - [ ] Merged live history of files and text on both pages
 - [ ] Optional PIN, QR code on the console, launcher script
 
 ## Text
 
-Tap the ✎ button in the header to type a message. On the phone, what you send
-shows up on the laptop page within a couple of seconds **and is copied to the
-Windows clipboard**, so you can paste it straight into whatever you were
-working in with Ctrl+V. Messages that made it into the clipboard are tagged
-*past ready* in the history.
+Tap the ✎ button in the header to type a message, on either device. Whatever
+you send shows up on the other screen within a couple of seconds, and every
+message has a **Copy** button so you can lift it onto that device's clipboard.
+
+On the laptop there is one extra behaviour: text arriving **from the phone** is
+copied to the Windows clipboard automatically, so you can paste it straight
+into whatever you were working in with Ctrl+V. Messages that made it into the
+clipboard are tagged *past ready* in the history.
 
 The clipboard switch only appears on the laptop page, because there is no
 Windows clipboard on the phone. Turn it off and the message is still saved and
 displayed — it just no longer takes over your clipboard.
 
+Text typed on the laptop never touches the clipboard: it is your own text, and
+you may well still want to paste it elsewhere.
+
 Every message is also written to `SharedFiles/Texts/` as
 `YYYYmmdd-HHMMSS_from-phone.txt`, so nothing is lost if you want to grep
 through old notes later.
 
-The clipboard is written through `ctypes` and Windows' own API — no `pip`
-install, no hidden tkinter window popping up, and no dependency on pyperclip.
+### Why the Copy button uses an old API
+
+`navigator.clipboard` — the modern clipboard — only works in a **secure
+context**. `http://localhost` counts as one, but `http://192.168.181.50` does
+not, so on the phone that API simply does not exist. The button therefore tries
+it first and falls back to selecting a throwaway `<textarea>` and calling
+`document.execCommand('copy')`, which still works over plain HTTP. If even that
+is refused, the button says **Press & hold** so the text is at least easy to
+select by hand.
+
+The Windows clipboard is written through `ctypes` and Win32 — no `pip`
+install, and no hidden tkinter window popping up.
 
 ## How a file actually reaches the phone
 
