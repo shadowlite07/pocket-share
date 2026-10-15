@@ -29,11 +29,14 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
+import hmac
 import http.client
 import json
 import mimetypes
 import os
 import re
+import secrets
 import socket
 import sys
 import threading
@@ -55,6 +58,18 @@ BIND_ADDRESS = "0.0.0.0"
 
 DEFAULT_PORT = 8765
 
+# Six digits that unlock the page. CHANGE THIS to something only you know.
+# Leave it as "" to turn the PIN off entirely.
+PIN = "123456"
+
+# How long an unlocked device stays unlocked before asking again.
+SESSION_HOURS = 12
+
+# Brute-force protection: after this many wrong PINs from one address, that
+# address is refused for a while.
+LOGIN_MAX_TRIES = 10
+LOGIN_LOCKOUT_SECONDS = 60
+
 # All shared data lives in here (created automatically on first run).
 DATA_DIR = Path(__file__).resolve().parent / "SharedFiles"
 
@@ -74,6 +89,10 @@ MAX_NAME_LEN = 120
 
 # Hard cap on index entries (history). Files on disk are never deleted.
 MAX_INDEX_ENTRIES = 5000
+
+# Endpoints reachable without unlocking. The page itself must load so it can
+# show the PIN box; nothing else does.
+AUTH_EXEMPT_PATHS = {"/", "/favicon.ico", "/api/login"}
 
 # Endpoints with their own tailored log line (uploads and downloads report
 # sender and destination, which is far more useful than "POST /api/upload").
@@ -612,6 +631,12 @@ def startup_banner(ip: str | None, port: int) -> None:
     print("       phone -> laptop traffic. Turn it off, or use a different hotspot.")
     print()
     print("  Press Ctrl+C to stop.")
+    if PIN:
+        print(line)
+        print(f"  PIN required: {'*' * len(PIN)}   (change PIN at the top of the script)")
+        if PIN == "123456":
+            print("  ! This is the default PIN - change it before using this anywhere")
+            print("    that other people can reach.")
     print(line)
     sys.stdout.flush()  # so the banner appears even when output is redirected
 
@@ -717,6 +742,104 @@ def read_clipboard() -> str:
         user32.CloseClipboard()
 
 
+# ============================== AUTH ================================
+#
+# The PIN only stops someone who opens the URL. Traffic is still plain HTTP,
+# so it does not stop a determined sniffer on the same network - see the
+# Security notes in the README.
+
+
+class Sessions:
+    """Unlocked devices, held in memory only.
+
+    Tokens deliberately do NOT survive a restart: if the laptop is rebooted
+    everyone has to type the PIN again, which is what you want.
+    """
+
+    def __init__(self, hours: int = SESSION_HOURS) -> None:
+        self._tokens: dict[str, float] = {}
+        self._lock = threading.Lock()
+        self._ttl = hours * 3600
+
+    def create(self) -> str:
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._prune_locked()
+            self._tokens[token] = time.time() + self._ttl
+        return token
+
+    def valid(self, token: str) -> bool:
+        if not token:
+            return False
+        with self._lock:
+            expires = self._tokens.get(token)
+            if expires is None:
+                return False
+            if expires < time.time():
+                del self._tokens[token]
+                return False
+            return True
+
+    def _prune_locked(self) -> None:
+        now = time.time()
+        for token in [t for t, exp in self._tokens.items() if exp < now]:
+            del self._tokens[token]
+
+    def count(self) -> int:
+        with self._lock:
+            self._prune_locked()
+            return len(self._tokens)
+
+
+class LoginGuard:
+    """Slows down guessing the PIN, per source address."""
+
+    def __init__(self, max_tries: int = LOGIN_MAX_TRIES,
+                 lockout: int = LOGIN_LOCKOUT_SECONDS) -> None:
+        self._fails: dict[str, list[float]] = {}
+        self._locked: dict[str, float] = {}
+        self._lock = threading.Lock()
+        self.max_tries = max_tries
+        self.lockout = lockout
+
+    def locked_for(self, ip: str) -> float:
+        """Seconds remaining on the lockout, or 0 if not locked."""
+        with self._lock:
+            until = self._locked.get(ip, 0)
+            if not until:
+                return 0
+            remaining = until - time.time()
+            if remaining <= 0:
+                del self._locked[ip]
+                self._fails.pop(ip, None)
+                return 0
+            return remaining
+
+    def record_failure(self, ip: str) -> None:
+        with self._lock:
+            now = time.time()
+            recent = [t for t in self._fails.get(ip, []) if now - t < 300]
+            recent.append(now)
+            self._fails[ip] = recent
+            if len(recent) >= self.max_tries:
+                self._locked[ip] = now + self.lockout
+                self._fails.pop(ip, None)
+
+    def record_success(self, ip: str) -> None:
+        with self._lock:
+            self._fails.pop(ip, None)
+            self._locked.pop(ip, None)
+
+
+def pin_matches(given: str) -> bool:
+    """Compare without leaking the PIN through timing."""
+    if not PIN:
+        return True  # PIN switched off
+    if not isinstance(given, str):
+        return False
+    return hmac.compare_digest(given.strip(), PIN)
+
+
 # ============================== SERVER ==============================
 
 
@@ -781,6 +904,10 @@ class ShareHandler(BaseHTTPRequestHandler):
             self._route(send_body)
         except UploadError as exc:
             self.log_message("!! %d %s (%s)", exc.status, exc.message, exc.detail)
+            # An error reply may come before the request body was read. Closing
+            # is cheap and stops the unread remainder from being mistaken for
+            # the next request line on a keep-alive connection.
+            self.close_connection = True
             try:
                 self._send_json(
                     {"ok": False, "error": exc.message, "detail": exc.detail},
@@ -811,6 +938,9 @@ class ShareHandler(BaseHTTPRequestHandler):
         else:
             query = {}
 
+        if route not in AUTH_EXEMPT_PATHS:
+            self._require_auth()
+
         if route == "/":
             self._send_bytes(PAGE_HTML.encode("utf-8"), "text/html; charset=utf-8",
                              send_body=send_body)
@@ -820,6 +950,8 @@ class ShareHandler(BaseHTTPRequestHandler):
             self._handle_delete(query)
         elif route == "/api/files" and self.command == "DELETE":
             self._handle_delete_all()
+        elif route == "/api/login":
+            self._handle_login()
         elif route == "/api/texts" and self.command == "DELETE":
             self._handle_clear_texts()
         elif route == "/api/texts":
@@ -899,6 +1031,53 @@ class ShareHandler(BaseHTTPRequestHandler):
         self.log_message("deleted %-9s (%s)", human_size(gone["size"]),
                          gone["rel_path"])
         self._send_json({"ok": True, **gone})
+
+    def _require_auth(self) -> None:
+        """Every API route except the login one goes through here."""
+        if not PIN:
+            return  # PIN switched off
+        token = self.headers.get("X-Auth-Token", "")
+        if not self.server.sessions.valid(token):
+            raise UploadError(401, "Locked",
+                              "Enter the PIN to unlock this page.")
+
+    def _handle_login(self) -> None:
+        """Swap the right PIN for a random token the page keeps."""
+        ip = self.client_address[0]
+
+        # Always consume the body, even when the PIN is switched off and the
+        # answer needs no input - otherwise it stays in the socket.
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+
+        if not PIN:
+            self._send_json({"ok": True, "pin_required": False, "token": ""})
+            return
+
+        try:
+            payload = json.loads(raw.decode("utf-8")) if length else {}
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise UploadError(400, "Bad request", str(exc)) from exc
+
+        # Check the lockout only after reading the body. Refusing early would
+        # leave an unread body in the socket, and the next request on that
+        # keep-alive connection would be parsed starting mid-JSON.
+        wait = self.server.login_guard.locked_for(ip)
+        if wait:
+            self.log_message("!! login locked out %s for %ds", ip, int(wait) + 1)
+            raise UploadError(429, "Too many tries",
+                              f"Wait {int(wait) + 1} seconds and try again.")
+
+        if not isinstance(payload, dict) or not pin_matches(payload.get("pin", "")):
+            self.server.login_guard.record_failure(ip)
+            self.log_message("!! wrong PIN from %s", ip)
+            raise UploadError(401, "Wrong PIN", "That PIN is not correct.")
+
+        self.server.login_guard.record_success(ip)
+        token = self.server.sessions.create()
+        self.log_message("unlocked %s (session %s)", ip, token[:8] + "...")
+        self._send_json({"ok": True, "pin_required": True, "token": token,
+                         "expires_in": SESSION_HOURS * 3600})
 
     def _handle_delete_all(self) -> None:
         result = self.server.store.delete_all_files()
@@ -1067,6 +1246,7 @@ class ShareHandler(BaseHTTPRequestHandler):
             "ok": True,
             "app": APP_NAME,
             "version": VERSION,
+            "pin_required": bool(PIN),
             "local_ip": detect_local_ip(),
             "bind": self.server.server_address[0],
             "port": self.server.server_address[1],
@@ -1247,6 +1427,8 @@ def main(argv: list[str] | None = None) -> int:
 
     server.store = store
     server.local_ip = detected_ip
+    server.sessions = Sessions()
+    server.login_guard = LoginGuard()
 
     advertised_ip = args.ip or detected_ip
     if args.host not in ("0.0.0.0", "::", ""):
@@ -1522,9 +1704,44 @@ PAGE_HTML = r"""
   }
   code { font-family: ui-monospace, Consolas, monospace; }
   .foot { text-align: center; color: var(--muted); font-size: 12px; margin-top: 16px; }
+
+  /* ---- lock screen ---- */
+  #lock {
+    position: fixed; inset: 0; z-index: 50;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--bg); padding: 20px;
+  }
+  #lock[hidden] { display: none; }
+  .lockbox { width: min(360px, 100%); text-align: center; }
+  .lockbox .glyph { font-size: 34px; margin-bottom: 10px; }
+  .lockbox h2 { font-size: 19px; margin: 0 0 4px; }
+  .lockbox p { color: var(--muted); font-size: 13px; margin: 0 0 18px; }
+  #pinInput {
+    width: 100%; text-align: center; letter-spacing: 10px;
+    font: 600 26px inherit; font-family: inherit; color: var(--text);
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 14px 12px 14px 22px;
+  }
+  #pinInput:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  #pinMsg {
+    min-height: 20px; font-size: 13px; margin: 10px 0 0; color: var(--danger);
+  }
 </style>
 </head>
 <body>
+<div id="lock">
+  <div class="lockbox">
+    <div class="glyph">&#128274;</div>
+    <h2>Teleport Share is locked</h2>
+    <p>Enter the PIN to unlock this device.</p>
+    <input type="text" id="pinInput" inputmode="numeric" autocomplete="off"
+           autocapitalize="off" spellcheck="false" maxlength="12"
+           placeholder="&bull;&bull;&bull;&bull;&bull;&bull;">
+    <p id="pinMsg" role="alert"></p>
+    <button type="button" class="btn" id="pinGo">Unlock</button>
+  </div>
+</div>
+
 <div class="wrap">
   <header>
     <h1>Teleport Share</h1>
@@ -1592,6 +1809,75 @@ PAGE_HTML = r"""
 (function () {
   'use strict';
 
+  // ---- lock screen ----
+  var TOKEN_KEY = 'pocketShare.token';
+  var token = null;
+  try { token = localStorage.getItem(TOKEN_KEY); } catch (err) { token = null; }
+
+  var lock = document.getElementById('lock');
+  var pinInput = document.getElementById('pinInput');
+  var pinMsg = document.getElementById('pinMsg');
+  var pinGo = document.getElementById('pinGo');
+
+  function showLock(message) {
+    lock.hidden = false;
+    if (message) pinMsg.textContent = message;
+    try { pinInput.focus(); pinInput.select(); } catch (err) {}
+  }
+
+  function unlock() {
+    var entered = pinInput.value.trim();
+    if (!entered) return;
+    pinGo.disabled = true;
+    pinMsg.textContent = '';
+    fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin: entered })
+    })
+      .then(function (r) {
+        return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+      })
+      .then(function (res) {
+        if (!res.ok || !res.d.ok) {
+          throw new Error(res.d.detail || 'That PIN is not correct.');
+        }
+        token = res.d.token || '';
+        try { localStorage.setItem(TOKEN_KEY, token); } catch (err) {}
+        pinInput.value = '';
+        lock.hidden = true;
+        start();
+      })
+      .catch(function (err) {
+        pinMsg.textContent = err.message;
+        pinInput.value = '';
+        try { pinInput.focus(); } catch (e) {}
+      })
+      .then(function () { pinGo.disabled = false; });
+  }
+
+  pinGo.addEventListener('click', unlock);
+  pinInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); unlock(); }
+  });
+
+  // One place that attaches the token and notices a locked session, so no
+  // request can accidentally go out unauthenticated.
+  function api(url, options) {
+    options = options || {};
+    options.headers = options.headers || {};
+    if (token) options.headers['X-Auth-Token'] = token;
+    return fetch(url, options).then(function (r) {
+      if (r.status === 401) {
+        token = null;
+        try { localStorage.removeItem(TOKEN_KEY); } catch (err) {}
+        showLock('Session expired - enter the PIN again.');
+        throw new Error('locked');
+      }
+      return r;
+    });
+  }
+
   var rows = document.getElementById('rows');
   var picker = document.getElementById('picker');
   var drop = document.getElementById('drop');
@@ -1657,6 +1943,7 @@ PAGE_HTML = r"""
       // Name is percent-encoded so Unicode names survive the query string.
       xhr.open('POST', '/api/upload?name=' + encodeURIComponent(file.name));
       xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      if (token) xhr.setRequestHeader('X-Auth-Token', token);
 
       xhr.upload.onprogress = function (e) {
         if (!e.lengthComputable) return;
@@ -1669,6 +1956,13 @@ PAGE_HTML = r"""
       xhr.onload = function () {
         var data = null;
         try { data = JSON.parse(xhr.responseText); } catch (err) {}
+        if (xhr.status === 401) {
+          token = null;
+          try { localStorage.removeItem(TOKEN_KEY); } catch (err) {}
+          showLock('Session expired - enter the PIN again.');
+          resolve();
+          return;
+        }
         if (xhr.status === 200 && data && data.ok) {
           row.fill.style.width = '100%';
           row.setMeta(fmt(data.size));
@@ -1772,7 +2066,7 @@ PAGE_HTML = r"""
     var text = textInput.value.trim();
     if (!text) return;
     textSend.disabled = true;
-    fetch('/api/text', {
+    api('/api/text', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: text })
@@ -1799,7 +2093,7 @@ PAGE_HTML = r"""
   });
 
   clipToggle.addEventListener('change', function () {
-    fetch('/api/settings', {
+    api('/api/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clipboard_autocopy: clipToggle.checked })
@@ -1807,7 +2101,7 @@ PAGE_HTML = r"""
   });
 
   function loadSettings() {
-    return fetch('/api/settings')
+    return api('/api/settings')
       .then(function (r) { return r.json(); })
       .then(function (d) {
         // Only the laptop has a Windows clipboard worth filling.
@@ -1855,7 +2149,7 @@ PAGE_HTML = r"""
       'This cannot be undone.')) {
       return Promise.reject(new Error('cancelled'));
     }
-    return fetch('/api/texts', { method: 'DELETE' })
+    return api('/api/texts', { method: 'DELETE' })
       .then(function (r) { return r.json(); })
       .then(function (d) { if (!d.ok) throw new Error(d.error || 'failed'); });
   }, 'Really clear?', 'Clear all messages');
@@ -1920,7 +2214,7 @@ PAGE_HTML = r"""
   }
 
   function pollMsgs() {
-    fetch('/api/texts?limit=20')
+    api('/api/texts?limit=20')
       .then(function (r) { return r.json(); })
       .then(function (d) { if (d.ok) renderMsgs(d.texts || []); })
       .catch(function () {});
@@ -2036,7 +2330,7 @@ PAGE_HTML = r"""
       'Saved messages under Texts\\ are kept.')) {
       return Promise.reject(new Error('cancelled'));
     }
-    return fetch('/api/files', { method: 'DELETE' })
+    return api('/api/files', { method: 'DELETE' })
       .then(function (r) { return r.json(); })
       .then(function (d) { if (!d.ok) throw new Error(d.error || 'failed'); });
   }, 'Really delete all?');
@@ -2086,8 +2380,8 @@ PAGE_HTML = r"""
       del.textContent = 'Delete';
       del.setAttribute('aria-label', 'Delete ' + it.name);
       armOnce(del, function () {
-        return fetch('/api/file?path=' + encodeURIComponent(it.rel_path),
-                     { method: 'DELETE' })
+        return api('/api/file?path=' + encodeURIComponent(it.rel_path),
+                   { method: 'DELETE' })
           .then(function (r) { return r.json(); })
           .then(function (d) { if (!d.ok) throw new Error(d.error || 'failed'); });
       }, 'Really delete?');
@@ -2120,7 +2414,7 @@ PAGE_HTML = r"""
   }
 
   function poll() {
-    fetch('/api/files?limit=200')
+    api('/api/files?limit=200')
       .then(function (r) { return r.json(); })
       .then(function (d) {
         if (!d.ok) throw new Error('bad response');
@@ -2136,14 +2430,11 @@ PAGE_HTML = r"""
     pollMsgs();
   }
 
-  pollAll();
-  setInterval(pollAll, 2000);
-
-  // ---- who am I, and where do files go ----
-  fetch('/api/info')
-    .then(function (r) { return r.json(); })
-    .then(function (d) {
-      setStatus('connected', false);
+  function pollInfo() {
+    api('/api/info')
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        setStatus('connected', false);
       var who = d.sender === 'laptop' ? 'Laptop' : 'Phone';
       isPhone = (d.sender !== 'laptop');
       loadSettings();
@@ -2157,6 +2448,32 @@ PAGE_HTML = r"""
     .catch(function () {
       setStatus('disconnected', true);
     });
+  }
+
+  // Nothing polls until this device has unlocked, so a locked page does not
+  // fire a request every two seconds just to be told it is locked.
+  var running = false;
+
+  function start() {
+    if (running) return;
+    running = true;
+    pollAll();
+    pollInfo();
+    setInterval(pollAll, 2000);
+    setInterval(pollInfo, 15000);
+  }
+
+  // If we already hold a token, try to use it; otherwise show the lock screen.
+  if (token) {
+    api('/api/info')
+      .then(function () {
+        lock.hidden = true;   // this device already has a valid session
+        start();
+      })
+      .catch(function () { showLock('Enter the PIN to unlock.'); });
+  } else {
+    showLock();
+  }
 })();
 </script>
 </body>

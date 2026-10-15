@@ -108,11 +108,40 @@ Built and working:
 - [x] Send text from the phone — an icon button opens a box, and the message
       lands on the laptop page and on your Windows clipboard
 - [x] Send text from the laptop, with a **Copy** button on the phone
+- [x] 6-digit PIN lock, with sessions and brute-force throttling
 
 Next:
 
-- [ ] Merged live history of files and text on both pages
-- [ ] Optional PIN, QR code on the console, launcher script
+- [ ] QR code on the console, double-click launcher script
+
+## Security
+
+The page is locked behind a **6-digit PIN**, set at the top of the script:
+
+```python
+PIN = "123456"        # CHANGE THIS
+```
+
+Both devices ask for it the first time. The correct PIN is exchanged for a
+random token that the browser keeps, so you only type it once per device (and
+again after the laptop restarts — sessions are deliberately not saved to
+disk). Guessing is slowed down: 10 wrong tries from one address locks it out
+for a minute.
+
+Set `PIN = ""` to switch the lock off entirely.
+
+Be honest about what this does and does not do:
+
+- It stops anyone who opens the URL from browsing, downloading or **deleting**
+  your files.
+- Traffic is still plain HTTP, so it does not stop someone running a packet
+  sniffer on the same network, who could capture the PIN or a token.
+- There is no HTTPS, because Python's standard library can use a certificate
+  but cannot generate one.
+- Lock your hotspot with a password if the network is not just you.
+
+Deleting also bypasses the Recycle Bin, so *Delete all files* is gone for
+good.
 
 ## Deleting
 
@@ -132,9 +161,6 @@ Two things worth knowing:
   files` cannot be recovered from.
 - Saved messages under `Texts\` are kept by *Delete all files* — only the
   transferred files are removed.
-
-Until the optional PIN exists (see *Status*), anything that can reach the page
-can also delete from it. Treat this as a reason to get the PIN in early.
 
 ## Text
 
