@@ -99,15 +99,24 @@ Built and working:
 - [x] Runs on both devices, prints the phone URL, detects the local IP
 - [x] Send files **from the phone** to the laptop, with progress bars
 - [x] Filename sanitising, collision handling, streaming for large files
-- [x] Live "Received" list on the laptop page
+- [x] Live file list on both pages, auto-updating
+- [x] Download any listed file on either device, including files copied into
+      `SharedFiles\` by hand
 
 Next:
 
-- [ ] Download files **on the phone** from what the laptop has shared
 - [ ] Send text in both directions (with optional auto-copy to the Windows
       clipboard, and a Copy button on the phone)
 - [ ] Merged live history of files and text on both pages
-- [ ] Optional PIN, QR code on the console, launcher script, full README
+- [ ] Optional PIN, QR code on the console, launcher script
+
+## Safety on the download side
+
+The phone asks for files by name, so the same hostile-input rules apply in
+reverse. A request is refused unless it survives three independent checks: no
+`..` segments, no absolute path, and — after resolving symlinks — the result
+must still be inside `SharedFiles\`. Internal files (`.teleport_index.json`,
+`_inbox_tmp\`, `Texts\`) are never listed and never served.
 
 ## Security notes
 

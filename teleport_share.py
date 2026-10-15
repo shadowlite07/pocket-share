@@ -31,6 +31,7 @@ import argparse
 import datetime
 import http.client
 import json
+import mimetypes
 import os
 import re
 import socket
@@ -40,7 +41,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 # ============================== CONFIG ==============================
 # Everything you are likely to want to change lives in this block.
@@ -67,8 +68,9 @@ MAX_NAME_LEN = 120
 # Hard cap on index entries (history). Files on disk are never deleted.
 MAX_INDEX_ENTRIES = 5000
 
-# Endpoints the page polls. Kept out of the console log on purpose.
-QUIET_PATHS = {"/api/recent"}
+# Endpoints the page polls, or that have their own tailored log line.
+# Kept out of the generic request log on purpose.
+QUIET_PATHS = {"/api/files", "/api/download"}
 
 # Reserved-for-later settings, so the top of the file stays the single place
 # to look. Unused by step 2; wired up in later steps.
@@ -242,16 +244,79 @@ class Store:
 
     # ---- files ----
 
-    def recent_files(self, limit: int = 12) -> list[dict]:
+    # Bookkeeping folders: never listed, never downloadable.
+    HIDDEN_DIRS = {"_inbox_tmp", "Texts"}
+
+    def _is_listed(self, rel: Path) -> bool:
+        """Is this relative path something the other device may see?"""
+        return not any(part.startswith(".") or part in self.HIDDEN_DIRS
+                       for part in rel.parts)
+
+    def list_files(self, limit: int = 200) -> list[dict]:
         """
-        Newest-first list of files that arrived, for the receive confirmation
-        on the page. Reads the index, so it only knows about uploads - files
-        copied into the folder by hand show up once the listing endpoint
-        walks the disk instead.
+        Every shareable file, newest first.
+
+        Walks the folder rather than the index, so files you copy in by hand
+        show up without being 'registered'. Symlinks that point outside the
+        data folder are skipped, and symlinked directories are never followed.
         """
-        with self._lock:
-            entries = [e for e in self._entries if e.get("type") == "file"]
-            return list(reversed(entries[-limit:]))
+        root = self.root.resolve()
+        entries: list[dict] = []
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(".") and d not in self.HIDDEN_DIRS]
+            here = Path(dirpath)
+            for filename in filenames:
+                if filename.startswith("."):
+                    continue
+                path = here / filename
+                rel = path.relative_to(root)
+                if not self._is_listed(rel):
+                    continue
+                try:
+                    resolved = path.resolve()
+                    if not resolved.is_relative_to(root):
+                        continue  # symlink escaping the data folder
+                    stat = resolved.stat()
+                except (OSError, ValueError):
+                    continue  # vanished or unreadable mid-walk
+                folder = rel.parts[0] if len(rel.parts) > 1 else ""
+                entries.append({
+                    "rel_path": rel.as_posix(),
+                    "name": filename,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "sender": "phone" if folder == "FromPhone" else "laptop",
+                    "manual": folder not in ("FromPhone", "FromLaptop"),
+                })
+        entries.sort(key=lambda e: e["mtime"], reverse=True)
+        return entries[:limit]
+
+    def resolve_for_download(self, raw: str) -> Path:
+        """
+        Turn a requested relative path into a real file inside the data folder,
+        or raise UploadError explaining why not.
+
+        Every check is deliberate and redundant: explicit rejection of '..',
+        then resolve(), then a containment test. Any one of them alone would do,
+        but this is the route where a bug means reading arbitrary files.
+        """
+        raw = (raw or "").strip()
+        if not raw:
+            raise UploadError(400, "No file requested",
+                              "The 'path' parameter was empty.")
+        rel = Path(raw.replace("\\", "/"))
+        if rel.is_absolute() or any(part in ("..", ".") for part in rel.parts):
+            raise UploadError(400, "Bad path",
+                              f"Refusing to serve {raw!r}.")
+        if not self._is_listed(rel):
+            raise UploadError(403, "Not available",
+                              f"{raw!r} is an internal file.")
+        root = self.root.resolve()
+        target = (root / rel).resolve()
+        if not target.is_relative_to(root) or not target.is_file():
+            raise UploadError(404, "File not found", f"No such file: {raw}")
+        return target
 
     def new_partial(self) -> Path:
         """A private scratch path for one in-flight upload."""
@@ -430,6 +495,20 @@ def discard_file(path: Path) -> None:
         pass
 
 
+def content_disposition(filename: str) -> str:
+    """
+    'attachment' with a readable name for every browser.
+
+    The plain filename= is an ASCII fallback (some old clients read only that);
+    filename*=UTF-8'' carries the real name so accents and non-Latin scripts
+    survive the round trip.
+    """
+    ascii_name = filename.encode("ascii", "replace").decode("ascii")
+    ascii_name = ascii_name.replace('"', "").replace("\\", "_")
+    return (f"attachment; filename=\"{ascii_name}\"; "
+            f"filename*=UTF-8''{quote(filename, safe='')}")
+
+
 class ShareHandler(BaseHTTPRequestHandler):
     # HTTP/1.1 keeps connections alive (needed for fast polling later).
     # It also means every response MUST carry an accurate Content-Length.
@@ -488,11 +567,13 @@ class ShareHandler(BaseHTTPRequestHandler):
                              send_body=send_body)
         elif route == "/api/info":
             self._send_json(self._info(), send_body=send_body)
-        elif route == "/api/recent":
-            limit = min(max(int((query.get("limit") or ["12"])[0] or 12), 1), 100)
-            self._send_json({"ok": True,
-                             "files": self.server.store.recent_files(limit)},
+        elif route == "/api/files":
+            limit = min(max(int((query.get("limit") or ["200"])[0] or 200), 1), 500)
+            self._send_json({"ok": True, "data_dir": str(self.server.store.root),
+                             "files": self.server.store.list_files(limit)},
                             send_body=send_body)
+        elif route == "/api/download":
+            self._handle_download(query)
         elif route == "/api/upload":
             self._handle_upload(query)
         elif route == "/favicon.ico":
@@ -502,6 +583,38 @@ class ShareHandler(BaseHTTPRequestHandler):
                 {"ok": False, "error": "Not found", "path": route},
                 status=404, send_body=send_body,
             )
+
+    def _handle_download(self, query: dict) -> None:
+        """
+        Stream a file back to the requesting device, a block at a time.
+        The path has already been checked to be inside the data folder.
+        """
+        raw = (query.get("path") or [""])[0]
+        path = self.server.store.resolve_for_download(raw)
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise UploadError(404, "File not found",
+                              f"{raw} could not be read: {exc}") from exc
+
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition", content_disposition(path.name))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+        sent = 0
+        with open(path, "rb") as handle:
+            while sent < size:
+                chunk = handle.read(min(CHUNK_SIZE, size - sent))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                sent += len(chunk)
+        self.log_message("sent    %-9s to %-15s (%s)",
+                         human_size(sent), self.client_address[0], raw)
 
     def _handle_upload(self, query: dict) -> None:
         """
@@ -903,10 +1016,22 @@ PAGE_HTML = r"""
     flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
     white-space: nowrap; font-size: 14px;
   }
+  ul.feed li .rowtop { display: flex; align-items: baseline; gap: 9px; }
+  ul.feed li .rowbot {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; margin-top: 6px;
+  }
   .feedsize {
     font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums;
-    white-space: nowrap;
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .dl {
+    flex: none; background: var(--accent-soft); color: var(--accent);
+    text-decoration: none; font-size: 13px; font-weight: 600;
+    padding: 8px 14px; border-radius: 9px; white-space: nowrap;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+  }
+  .dl:active { opacity: .65; }
   .empty { color: var(--muted); font-size: 14px; margin: 0; }
 
   /* ---- connection ---- */
@@ -941,9 +1066,9 @@ PAGE_HTML = r"""
   </div>
 
   <div class="card">
-    <h2>Received</h2>
+    <h2>Files on the laptop</h2>
     <ul class="feed" id="feed"></ul>
-    <p class="empty" id="feedEmpty">Nothing yet. Send a file from the phone.</p>
+    <p class="empty" id="feedEmpty">Nothing shared yet.</p>
   </div>
 
   <div class="card">
@@ -1113,11 +1238,24 @@ PAGE_HTML = r"""
     clearBtn.disabled = true;
   });
 
-  // ---- received files: polled so an upload shows up on its own ----
+  // ---- files on the laptop: polled so an upload shows up on its own ----
   var feed = document.getElementById('feed');
   var feedEmpty = document.getElementById('feedEmpty');
-  var newestId = 0;
+  var seen = {};
+  var seenCount = 0;
   var primed = false;
+  var lastSignature = '';
+
+  function signatureOf(items) {
+    // Rebuilding the list every 2s would replace the DOM nodes underneath the
+    // user's finger, so a tap on Download can land on a detached element and
+    // do nothing. Nothing is re-rendered unless something actually changed.
+    var parts = [];
+    for (var i = 0; i < items.length; i++) {
+      parts.push(items[i].rel_path + '|' + items[i].mtime + '|' + items[i].size);
+    }
+    return parts.join(',');
+  }
 
   function clockOf(ts) {
     try {
@@ -1130,34 +1268,58 @@ PAGE_HTML = r"""
   }
 
   function renderFeed(items) {
+    var signature = signatureOf(items);
+    if (signature === lastSignature) return;
+    lastSignature = signature;
+
     feedEmpty.style.display = items.length ? 'none' : 'block';
     feed.textContent = '';
-    var highest = newestId;
     items.forEach(function (it) {
+      // These come from the disk, not the index, so there is no id to track -
+      // name plus mtime identifies "this is the version I have not seen".
+      var key = it.rel_path + '|' + it.mtime;
       var li = document.createElement('li');
-      if (primed && it.id > newestId) li.className = 'fresh';
+      if (primed && !seen[key]) li.className = 'fresh';
+
+      var top = document.createElement('div');
+      top.className = 'rowtop';
       var tag = document.createElement('span');
       tag.className = 'fdir ' + it.sender;
       tag.textContent = it.sender === 'phone' ? 'PHONE' : 'LAPTOP';
       var name = document.createElement('span');
       name.className = 'feedname';
-      name.textContent = it.stored_name;      // never innerHTML: name is user input
-      name.title = it.rel_path || it.stored_name;
+      name.textContent = it.name;             // never innerHTML: name is user input
+      name.title = it.rel_path;
+      top.appendChild(tag);
+      top.appendChild(name);
+
+      var bot = document.createElement('div');
+      bot.className = 'rowbot';
       var meta = document.createElement('span');
       meta.className = 'feedsize';
-      meta.textContent = fmt(it.size || 0) + '  ' + clockOf(it.ts);
-      li.appendChild(tag);
-      li.appendChild(name);
-      li.appendChild(meta);
+      meta.textContent = fmt(it.size || 0) + '  ·  ' + clockOf(it.mtime) +
+        (it.manual ? '  ·  copied in by hand' : '');
+      var link = document.createElement('a');
+      link.className = 'dl';
+      link.textContent = 'Download';
+      link.href = '/api/download?path=' + encodeURIComponent(it.rel_path);
+      link.setAttribute('download', it.name);
+      bot.appendChild(meta);
+      bot.appendChild(link);
+
+      li.appendChild(top);
+      li.appendChild(bot);
       feed.appendChild(li);
-      if (it.id > highest) highest = it.id;
+
+      if (!seen[key]) { seen[key] = true; seenCount++; }
     });
-    newestId = highest;
+    // Keep the memory-tracking map from growing forever.
+    if (seenCount > 300) { seen = {}; seenCount = 0; primed = true; }
     primed = true;
   }
 
   function poll() {
-    fetch('/api/recent?limit=12')
+    fetch('/api/files?limit=200')
       .then(function (r) { return r.json(); })
       .then(function (d) {
         if (!d.ok) throw new Error('bad response');
