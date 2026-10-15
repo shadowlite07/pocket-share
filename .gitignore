@@ -22,3 +22,7 @@ venv/
 Thumbs.db
 desktop.ini
 .DS_Store
+# Build output from PyInstaller
+build/
+dist/
+*.spec

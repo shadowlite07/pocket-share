@@ -62,8 +62,6 @@ DEFAULT_PORT = 8765
 # .env next to this script, which is never committed.
 PIN = "123456"
 
-ENV_FILE = Path(__file__).resolve().parent / ".env"
-
 # How long an unlocked device stays unlocked before asking again.
 SESSION_HOURS = 12
 
@@ -72,8 +70,21 @@ SESSION_HOURS = 12
 LOGIN_MAX_TRIES = 10
 LOGIN_LOCKOUT_SECONDS = 60
 
+# Where the app "lives" - the folder holding this file when run from source,
+# or the folder holding the .exe when frozen. This matters: a PyInstaller
+# one-file build unpacks itself into a temp directory, and __file__ points
+# there, so using it directly would put SharedFiles in a folder that is
+# deleted the moment the app exits, and .env would never be found.
+if getattr(sys, "frozen", False):
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    APP_DIR = Path(__file__).resolve().parent
+
 # All shared data lives in here (created automatically on first run).
-DATA_DIR = Path(__file__).resolve().parent / "SharedFiles"
+DATA_DIR = APP_DIR / "SharedFiles"
+
+# The PIN, read from here. Kept out of version control.
+ENV_FILE = APP_DIR / ".env"
 
 # Reads/writes the socket in blocks of this size. Never loads a whole file
 # into memory, so a 4 GB video costs the same RAM as a 4 KB text file.
@@ -913,13 +924,19 @@ def pin_matches(given: str) -> bool:
 
 
 class UploadError(Exception):
-    """A problem with an upload that the browser should be told about."""
+    """A problem with an upload that the browser should be told about.
 
-    def __init__(self, status: int, message: str, detail: str = "") -> None:
+    'quiet' marks a reply that is entirely expected - a locked page polling
+    is normal operation, not something worth a line of console every 2 seconds.
+    """
+
+    def __init__(self, status: int, message: str, detail: str = "",
+                 quiet: bool = False) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
         self.detail = detail
+        self.quiet = quiet
 
 
 def discard_file(path: Path) -> None:
@@ -972,7 +989,9 @@ class ShareHandler(BaseHTTPRequestHandler):
         try:
             self._route(send_body)
         except UploadError as exc:
-            self.log_message("!! %d %s (%s)", exc.status, exc.message, exc.detail)
+            if not exc.quiet:
+                self.log_message("!! %d %s (%s)", exc.status, exc.message,
+                                 exc.detail)
             # An error reply may come before the request body was read. Closing
             # is cheap and stops the unread remainder from being mistaken for
             # the next request line on a keep-alive connection.
@@ -1108,7 +1127,7 @@ class ShareHandler(BaseHTTPRequestHandler):
         token = self.headers.get("X-Auth-Token", "")
         if not self.server.sessions.valid(token):
             raise UploadError(401, "Locked",
-                              "Enter the PIN to unlock this page.")
+                              "Enter the PIN to unlock this page.", quiet=True)
 
     def _handle_login(self) -> None:
         """Swap the right PIN for a random token the page keeps."""
@@ -1482,10 +1501,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def build_server(host: str, port: int) -> tuple[ShareServer, str, Store, int]:
     """
-    Create everything a running server needs.
-
-    Shared by the command line and the GUI so the two cannot drift apart.
-    Returns (server, local_ip, store, stale_uploads_cleaned).
+    Create everything a running server needs, in one place so the wiring
+    cannot drift. Returns (server, local_ip, store, stale_uploads_cleaned).
     """
     store = Store(DATA_DIR)
     store.start()
@@ -1960,13 +1977,21 @@ PAGE_HTML = r"""
     if (token) options.headers['X-Auth-Token'] = token;
     return fetch(url, options).then(function (r) {
       if (r.status === 401) {
-        token = null;
-        try { localStorage.removeItem(TOKEN_KEY); } catch (err) {}
-        showLock('Session expired - enter the PIN again.');
+        lockedOut();
         throw new Error('locked');
       }
       return r;
     });
+  }
+
+  // The session is gone - the laptop restarted, or it expired. Stop polling
+  // immediately: a locked page still asking every 2 seconds would fill the
+  // console with '401 Locked' lines for as long as the tab stays open.
+  function lockedOut() {
+    token = null;
+    try { localStorage.removeItem(TOKEN_KEY); } catch (err) {}
+    halt();
+    showLock('Session expired - enter the PIN again.');
   }
 
   var rows = document.getElementById('rows');
@@ -2048,9 +2073,7 @@ PAGE_HTML = r"""
         var data = null;
         try { data = JSON.parse(xhr.responseText); } catch (err) {}
         if (xhr.status === 401) {
-          token = null;
-          try { localStorage.removeItem(TOKEN_KEY); } catch (err) {}
-          showLock('Session expired - enter the PIN again.');
+          lockedOut();
           resolve();
           return;
         }
@@ -2544,14 +2567,23 @@ PAGE_HTML = r"""
   // Nothing polls until this device has unlocked, so a locked page does not
   // fire a request every two seconds just to be told it is locked.
   var running = false;
+  var timerFiles = null;
+  var timerInfo = null;
+
+  function halt() {
+    running = false;
+    if (timerFiles) clearInterval(timerFiles);
+    if (timerInfo) clearInterval(timerInfo);
+    timerFiles = timerInfo = null;
+  }
 
   function start() {
     if (running) return;
     running = true;
     pollAll();
     pollInfo();
-    setInterval(pollAll, 2000);
-    setInterval(pollInfo, 15000);
+    timerFiles = setInterval(pollAll, 2000);
+    timerInfo = setInterval(pollInfo, 15000);
   }
 
   // If we already hold a token, try to use it; otherwise show the lock screen.
@@ -2571,20 +2603,6 @@ PAGE_HTML = r"""
 </html>"""
 
 
-
-
-def load_settings() -> dict:
-    """
-    Apply .env the same way main() does. The GUI has no argv, so it needs the
-    PIN set up before anything else looks at it.
-    """
-    ts_ensure = ensure_env_file(ENV_FILE)
-    env = load_env_file(ENV_FILE)
-    if "PIN" in env:
-        globals()["PIN"] = env["PIN"].strip()
-        return {"source": ENV_FILE.name, "generated": ts_ensure}
-    return {"source": "the fallback inside the script (no PIN in .env)",
-            "generated": ts_ensure}
 
 
 # ============================== ENTRY POINT ==============================

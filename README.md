@@ -23,17 +23,11 @@ Python 3.9+ on Windows. Nothing else.
 
 ## Run it
 
-**As an app (Windows):**
+**As a standalone app** — download `pocket-share.exe` and double-click it. No
+Python needed on that machine. It keeps its `SharedFiles` folder and its `.env`
+right next to the executable.
 
-```
-python pocket_share.py
-```
-
-A small window starts the server for you, shows both addresses with Copy and
-Open buttons, reveals the PIN on demand, opens the data folder, and shows live
-activity so you can see transfers happening without watching a console.
-
-**As a command line tool:**
+**From source:**
 
 ```
 python teleport_share.py
@@ -277,6 +271,19 @@ particular app.
 A quick way to try it before writing any app: run the script in **Termux**
 (F-Droid, not the Play Store), `pkg install python`, then
 `python teleport_share.py`.
+
+## Building the .exe yourself
+
+PyInstaller is only needed to build, never to run — the resulting `.exe` is
+self-contained.
+
+```
+pip install pyinstaller
+python -m PyInstaller --onefile --name pocket-share --console teleport_share.py
+```
+
+The result is `dist/pocket-share.exe` (~9 MB). `build/`, `dist/` and the
+generated `.spec` are gitignored.
 
 ## License
 
