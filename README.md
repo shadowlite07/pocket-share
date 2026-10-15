@@ -102,6 +102,8 @@ Built and working:
 - [x] Live file list on both pages, auto-updating
 - [x] Download any listed file on either device, including files copied into
       `SharedFiles\` by hand
+- [x] Files the laptop shares are saved on the phone automatically — no tap,
+      no confirmation step
 
 Next:
 
@@ -109,6 +111,28 @@ Next:
       clipboard, and a Copy button on the phone)
 - [ ] Merged live history of files and text on both pages
 - [ ] Optional PIN, QR code on the console, launcher script
+
+## How a file actually reaches the phone
+
+The laptop runs the server, so every file passes through it — the laptop is
+the origin, not a relay it can bypass. The phone is what saves the file, by
+fetching it over HTTP; nothing else can write to the phone's storage without
+an app installed on it.
+
+So when you share a file from the laptop, the phone's open page notices it
+within a couple of seconds and saves it on its own. Which files it takes:
+
+- Anything the laptop shared or you copied in by hand — saved automatically
+- Anything the phone itself sent — skipped, it already has those
+
+Already-saved files are remembered in the browser, so reloading the page
+never re-downloads the history. If the phone's page was closed when something
+was shared, it is simply waiting in the list when you reopen it.
+
+One caveat, and it is a platform limit rather than a choice: iOS Safari
+refuses downloads that were not triggered by a real tap. On an iPhone the
+file will usually need one tap on its **Download** button. Android Chrome
+saves it silently.
 
 ## Safety on the download side
 

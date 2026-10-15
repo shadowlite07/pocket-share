@@ -68,9 +68,9 @@ MAX_NAME_LEN = 120
 # Hard cap on index entries (history). Files on disk are never deleted.
 MAX_INDEX_ENTRIES = 5000
 
-# Endpoints the page polls, or that have their own tailored log line.
-# Kept out of the generic request log on purpose.
-QUIET_PATHS = {"/api/files", "/api/download"}
+# Endpoints with their own tailored log line (uploads and downloads report
+# sender and destination, which is far more useful than "POST /api/upload").
+QUIET_PATHS = {"/api/files", "/api/upload", "/api/download"}
 
 # Reserved-for-later settings, so the top of the file stays the single place
 # to look. Unused by step 2; wired up in later steps.
@@ -569,9 +569,16 @@ class ShareHandler(BaseHTTPRequestHandler):
             self._send_json(self._info(), send_body=send_body)
         elif route == "/api/files":
             limit = min(max(int((query.get("limit") or ["200"])[0] or 200), 1), 500)
-            self._send_json({"ok": True, "data_dir": str(self.server.store.root),
-                             "files": self.server.store.list_files(limit)},
-                            send_body=send_body)
+            self._send_json({
+                "ok": True,
+                "data_dir": str(self.server.store.root),
+                # Which side is asking. Included here as well as in /api/info
+                # so the page needs only this one request to decide whether to
+                # auto-save; waiting for a second response would race.
+                "sender": identify_sender(self.client_address[0],
+                                          getattr(self.server, "local_ip", None)),
+                "files": self.server.store.list_files(limit),
+            }, send_body=send_body)
         elif route == "/api/download":
             self._handle_download(query)
         elif route == "/api/upload":
@@ -1245,6 +1252,48 @@ PAGE_HTML = r"""
   var seenCount = 0;
   var primed = false;
   var lastSignature = '';
+  var isPhone = false;
+
+  // Files the phone has already saved, remembered across page reloads so a
+  // reload never re-downloads the whole history.
+  var SAVED_KEY = 'pocketShare.saved';
+
+  function loadSaved() {
+    try {
+      return JSON.parse(localStorage.getItem(SAVED_KEY)) || [];
+    } catch (err) {
+      return [];
+    }
+  }
+
+  function markSaved(relPath) {
+    try {
+      var list = loadSaved();
+      if (list.indexOf(relPath) === -1) list.push(relPath);
+      if (list.length > 300) list = list.slice(-300);
+      localStorage.setItem(SAVED_KEY, JSON.stringify(list));
+    } catch (err) {
+      // Private mode / storage disabled: we just re-download next reload.
+    }
+  }
+
+  // Save the file without asking. Using an anchor with the download attribute
+  // lets the browser stream it natively - the file never passes through JS
+  // memory, so size does not matter.
+  function autoSave(item) {
+    try {
+      var link = document.createElement('a');
+      link.href = '/api/download?path=' + encodeURIComponent(item.rel_path);
+      link.download = item.name;
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch (err) {
+      // Some browsers refuse downloads with no user gesture. The Download
+      // button on the row is still there, so nothing is lost.
+    }
+  }
 
   function signatureOf(items) {
     // Rebuilding the list every 2s would replace the DOM nodes underneath the
@@ -1316,6 +1365,18 @@ PAGE_HTML = r"""
     // Keep the memory-tracking map from growing forever.
     if (seenCount > 300) { seen = {}; seenCount = 0; primed = true; }
     primed = true;
+
+    // On the phone, anything the laptop shared is saved straight away - no tap,
+    // no confirmation. Files the phone sent are skipped: it already has them.
+    if (isPhone) {
+      var saved = loadSaved();
+      items.forEach(function (it) {
+        if (it.sender === 'phone') return;
+        if (saved.indexOf(it.rel_path) !== -1) return;
+        markSaved(it.rel_path);
+        autoSave(it);
+      });
+    }
   }
 
   function poll() {
@@ -1324,6 +1385,7 @@ PAGE_HTML = r"""
       .then(function (d) {
         if (!d.ok) throw new Error('bad response');
         setStatus('connected', false);
+        isPhone = (d.sender !== 'laptop');
         renderFeed(d.files || []);
       })
       .catch(function () { setStatus('disconnected', true); });
