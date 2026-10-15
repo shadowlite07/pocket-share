@@ -102,8 +102,9 @@ Built and working:
 - [x] Live file list on both pages, auto-updating
 - [x] Download any listed file on either device, including files copied into
       `SharedFiles\` by hand
-- [x] Files the laptop shares are saved on the phone automatically — no tap,
-      no confirmation step
+- [x] Files the laptop shares are started automatically on the phone — the
+      phone fetches them without you finding them in a list (Android Chrome
+      still asks you to confirm with **Keep**, see below)
 
 Next:
 
@@ -120,19 +121,28 @@ fetching it over HTTP; nothing else can write to the phone's storage without
 an app installed on it.
 
 So when you share a file from the laptop, the phone's open page notices it
-within a couple of seconds and saves it on its own. Which files it takes:
+within a couple of seconds and starts saving it by itself. Which files it takes:
 
-- Anything the laptop shared or you copied in by hand — saved automatically
+- Anything the laptop shared or you copied in by hand
 - Anything the phone itself sent — skipped, it already has those
 
 Already-saved files are remembered in the browser, so reloading the page
 never re-downloads the history. If the phone's page was closed when something
 was shared, it is simply waiting in the list when you reopen it.
 
-One caveat, and it is a platform limit rather than a choice: iOS Safari
-refuses downloads that were not triggered by a real tap. On an iPhone the
-file will usually need one tap on its **Download** button. Android Chrome
-saves it silently.
+### What you'll still see on the phone
+
+The page starts the download for you, so the file turns up on its own instead
+of you hunting for it in the list. Android Chrome then shows a **Discard /
+Keep** prompt, because the page is served over plain `http://` and Chrome
+does not consider an insecure download trustworthy. Tap **Keep** and it saves.
+iOS Safari does something similar on some versions.
+
+This is a browser security decision, not something the server can turn off.
+If the prompt bothers you, `chrome://flags/#allow-insecure-downloads` in
+Chrome removes it. The alternative — HTTPS — needs a certificate, and a
+self-signed one is not trusted by Chrome either, so it may not help while
+adding a "connection is not private" warning of its own.
 
 ## Safety on the download side
 
