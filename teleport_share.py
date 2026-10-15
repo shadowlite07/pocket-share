@@ -758,6 +758,9 @@ class ShareHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = f"{APP_NAME}/{VERSION}"
     sys_version = ""  # don't advertise the Python version
+    # Nagle's algorithm holds back small writes waiting for an ACK, which adds
+    # up to 40ms of delay per exchange on a slow link. Free to turn off.
+    disable_nagle_algorithm = True
 
     # ---- request routing ----
 
