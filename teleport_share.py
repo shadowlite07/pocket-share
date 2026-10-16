@@ -2923,7 +2923,8 @@ def run_gui(argv: list[str] | None = None) -> int:
         def isatty(self) -> bool:
             return False
 
-    state = {"server": None, "thread": None, "closing": False, "port": 0}
+    state = {"server": None, "thread": None, "closing": False, "port": 0,
+             "lock": threading.Lock()}
     lines: "queue.Queue[list[str]]" = queue.Queue()
     webview_window = None
 
@@ -3007,17 +3008,39 @@ def run_gui(argv: list[str] | None = None) -> int:
   view.src = toApi('/');
   setRunning(true);
 
-  startBtn.addEventListener('click', function () {
+  // Start and stop are posted to THIS page's own origin, which is the shell
+  // that wraps the file server. Posting them to the file server's address
+  // (toApi) silently did nothing, because it has no such route - that is why
+  // Stop used to leave the server reachable from the phone.
+  function command(path, busy) {
     startBtn.disabled = true;
-    note.textContent = 'Starting...';
-    view.src = toApi('/');
-    setRunning(true);
+    stopBtn.disabled = true;
+    note.textContent = busy;
+    return fetch(path, { method: 'POST' })
+      .then(function (r) { return r.json().then(function (d) {
+        return { ok: r.ok && d.ok !== false, data: d };
+      }); })
+      .catch(function () { return { ok: false, data: {} }; });
+  }
+
+  startBtn.addEventListener('click', function () {
+    command('/api/start', 'Starting...').then(function (res) {
+      if (!res.ok) {
+        // Say what happened. Pretending it started would leave the window
+        // claiming to be connected to a server that is not there.
+        setRunning(false, 'Could not start: ' + (res.data.error || 'unknown error'));
+        return;
+      }
+      // Reload against the address the server actually came up on.
+      view.src = toApi('/');
+      setRunning(true);
+    });
   });
 
   stopBtn.addEventListener('click', function () {
-    // Ask the server to close itself down; the window follows shortly after.
-    fetch(toApi('/api/shutdown'), { method: 'POST' }).catch(function () {});
-    setRunning(false, 'Stopped. Close the window to exit.');
+    command('/api/stop', 'Stopping...').then(function () {
+      setRunning(false, 'Stopped. Nothing on the network can reach it now.');
+    });
   });
 </script>
 </body></html>"""
@@ -3037,26 +3060,60 @@ def run_gui(argv: list[str] | None = None) -> int:
             def log_message(self, *args) -> None:
                 pass  # quiet: the window has its own notes line
 
-            def _send(self, body: bytes, ctype: str) -> None:
-                self.send_response(200)
+            def _send(self, body: bytes, ctype: str, status: int = 200) -> None:
+                self.send_response(status)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _send_json(self, data: dict, status: int = 200) -> None:
+                self._send(json.dumps(data).encode("utf-8"),
+                           "application/json", status)
+
             def do_GET(self) -> None:
-                if self.path.startswith("/api/shutdown"):
-                    threading.Thread(target=_stop, daemon=True).start()
-                    self._send(b'{"ok":true}', "application/json")
+                route = self.path.split("?", 1)[0]
+                # Same-origin requests, so the window can ask about the server
+                # without needing to know its address.
+                if route == "/api/state":
+                    self._send_json({"running": bool(state["server"]),
+                                     "port": state["port"]})
                     return
                 self._send(BAR_HTML.replace("__PORT__", str(state["port"]))
                            .encode("utf-8"), "text/html; charset=utf-8")
 
             def do_POST(self) -> None:
-                if self.path.startswith("/api/shutdown"):
+                """
+                Start and stop the file server.
+
+                These are handled HERE, on the bar's own port, not on the
+                file server's. An earlier version had the page post to the
+                file server instead, which has no such route: Stop appeared
+                to work and silently did nothing.
+                """
+                route = self.path.split("?", 1)[0]
+
+                # Read the body first. Under HTTP/1.1 an unread body is
+                # mistaken for the next request on a kept-alive connection.
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+
+                if route == "/api/stop":
                     threading.Thread(target=_stop, daemon=True).start()
-                self._send(b'{"ok":true}', "application/json")
+                    self._send_json({"ok": True, "running": False})
+                    return
+
+                if route == "/api/start":
+                    ok, message = _start_server()
+                    self._send_json({"ok": ok, "running": bool(state["server"]),
+                                     "port": state["port"], "error": message},
+                                    status=200 if ok else 500)
+                    return
+
+                self._send_json({"ok": False, "error": "Unknown command"},
+                                status=404)
 
         httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), BarHandler)
         httpd.daemon_threads = True
@@ -3065,43 +3122,81 @@ def run_gui(argv: list[str] | None = None) -> int:
         webview_window = f"http://127.0.0.1:{port}/"
         log(f"Window shell on {webview_window}")
 
-    def _start_server() -> bool:
-        if state["server"]:
-            return True
-        ensure_env_file(ENV_FILE)
-        env = load_env_file(ENV_FILE)
-        if "PIN" in env:
-            globals()["PIN"] = env["PIN"].strip()
-            source = ENV_FILE.name
-        else:
-            source = "the built-in default"
+    def _start_server() -> tuple[bool, str]:
+        """
+        Bring the file server up. Safe to call again after a Stop.
 
-        sys.stdout = LogBridge(lines)
-        try:
-            server, detected_ip, _store, _stale = build_server(
-                BIND_ADDRESS, DEFAULT_PORT)
-        except OSError as exc:
-            log(f"ERROR: {exc}")
-            return False
+        Returns (succeeded, message). The message is the reason on failure,
+        so the window can say what went wrong instead of claiming success.
+        """
+        with state["lock"]:
+            if state["server"]:
+                return True, ""
 
-        state["server"] = server
-        state["port"] = server.server_address[1]
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        log(f"Listening on port {state['port']}  (PIN from {source})")
-        return True
+            ensure_env_file(ENV_FILE)
+            env = load_env_file(ENV_FILE)
+            if "PIN" in env:
+                globals()["PIN"] = env["PIN"].strip()
+                source = ENV_FILE.name
+            else:
+                source = "the built-in default"
+
+            sys.stdout = LogBridge(lines)
+
+            # Rebinding the same port straight after closing it can fail on
+            # Windows while the old connections settle. Retry briefly rather
+            # than telling the user the port is taken by something else.
+            last = ""
+            for attempt in range(6):
+                try:
+                    server, _detected, _store, _stale = build_server(
+                        BIND_ADDRESS, DEFAULT_PORT)
+                    break
+                except OSError as exc:
+                    last = str(exc)
+                    if state["closing"]:
+                        return False, "the app is closing"
+                    if attempt == 5:
+                        log(f"ERROR: {exc}")
+                        return False, last
+                    time.sleep(0.4)
+                    log(f"Port {DEFAULT_PORT} not free yet, retrying...")
+            else:  # pragma: no cover - the loop always breaks or returns
+                return False, last
+
+            state["server"] = server
+            state["port"] = server.server_address[1]
+            state["closing"] = False
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            log(f"Listening on port {state['port']}  (PIN from {source})")
+            return True, ""
 
     def _stop() -> None:
-        """Stop the server. No widgets touched - this can run off-thread."""
-        server = state["server"]
-        if not server:
-            return
-        state["closing"] = True
-        log("Stopping...")
-        try:
-            server.shutdown()
-        finally:
-            server.server_close()
-            state["server"] = None
+        """
+        Stop the server, completely.
+
+        No widgets are touched, so this can run off the request thread. Both
+        shutdown() and server_close() matter: the first ends serve_forever,
+        the second actually closes the listening socket. Without the second,
+        the port stays bound and the phone can still reach the old server.
+        """
+        with state["lock"]:
+            server = state["server"]
+            if not server:
+                return
+            state["server"] = None          # claim it first, so a concurrent
+            state["port"] = 0                # Start cannot race with us
+            log("Stopping...")
+            try:
+                server.shutdown()
+            except Exception as exc:       # noqa: BLE001
+                log(f"(shutdown reported {exc})")
+            finally:
+                try:
+                    server.server_close()
+                except Exception as exc:   # noqa: BLE001
+                    log(f"(close reported {exc})")
+                log("Stopped. Nothing is listening on the network now.")
 
     def show_error(message: str) -> None:
         """A windowed build has no console, so errors have to be shown."""
@@ -3123,8 +3218,10 @@ def run_gui(argv: list[str] | None = None) -> int:
     # EdgeChromium backend binds its message loop to it and simply dies on a
     # worker. So the server is started first, on this thread, and the window
     # runs afterwards; webview.start() blocks until the window closes.
-    if not _start_server():
-        show_error(lines.get() if not lines.empty() else "unknown error")
+    ok, message = _start_server()
+    if not ok:
+        show_error(message or (lines.get() if not lines.empty()
+                               else "unknown error"))
         return 0
     load_page()
 
