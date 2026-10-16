@@ -114,6 +114,16 @@ DATA_DIR = APP_DIR / "SharedFiles"
 # The PIN, read from here. Kept out of version control.
 ENV_FILE = APP_DIR / ".env"
 
+# The logo. One file serves everything: the browser tab, the page header, the
+# window and the taskbar. An .ico is used because Windows insists on one for
+# the window, and every browser renders it happily in an <img> too, so there
+# is no second copy to keep in step.
+#
+# Plain rasters are listed first, so dropping a .png or .jpg beside the
+# executable overrides the .ico for the web page without a rebuild.
+LOGO_NAMES = ("logo.png", "logo.jpg", "logo.jpeg", "logo.ico")
+ICON_NAMES = ("logo.ico", "logo.png")
+
 # Reads/writes the socket in blocks of this size. Never loads a whole file
 # into memory, so a 4 GB video costs the same RAM as a 4 KB text file.
 CHUNK_SIZE = 256 * 1024
@@ -132,13 +142,17 @@ MAX_NAME_LEN = 120
 MAX_INDEX_ENTRIES = 5000
 
 # Endpoints reachable without unlocking. The page itself must load so it can
-# show the PIN box; nothing else does.
-AUTH_EXEMPT_PATHS = {"/", "/favicon.ico", "/api/login"}
+# show the PIN box, and so can the logo it displays while still locked.
+AUTH_EXEMPT_PATHS = {"/", "/favicon.ico", "/logo", "/api/login"}
 
 # Endpoints with their own tailored log line (uploads and downloads report
 # sender and destination, which is far more useful than "POST /api/upload").
+# The asset and QR routes are in here too: the page asks for the logo on
+# every load and for the QR every time the panel is opened, and neither is
+# news.
 QUIET_PATHS = {"/api/files", "/api/upload", "/api/download",
-               "/api/texts", "/api/text", "/api/settings", "/api/file"}
+               "/api/texts", "/api/text", "/api/settings", "/api/file",
+               "/logo", "/favicon.ico", "/api/qr.svg"}
 
 # Reserved-for-later settings, so the top of the file stays the single place
 # to look. Unused by step 4; wired up in later steps.
@@ -155,6 +169,72 @@ def fix_console_encoding() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
+
+
+# =============================== ASSETS ==============================
+# The logo. Both the browser tab and the window icon read from here, so the
+# project carries one image rather than three copies of it.
+
+_ASSET_CACHE: dict[tuple[str, ...], Path | None] = {}
+
+
+def find_asset(names: tuple[str, ...]) -> Path | None:
+    """Locate the first of `names` that exists, searching where assets live.
+
+    Two places matter. Next to the script or executable is checked first, so
+    you can swap the logo without rebuilding. After that comes the folder a
+    PyInstaller one-file build unpacks its bundled data into, which is what
+    makes the icon survive inside a single .exe.
+    """
+    if names in _ASSET_CACHE:
+        return _ASSET_CACHE[names]
+
+    folders = [APP_DIR]
+    unpacked = getattr(sys, "_MEIPASS", None)
+    if unpacked:
+        folders.append(Path(unpacked))
+
+    found: Path | None = None
+    for folder in folders:
+        for name in names:
+            candidate = folder / name
+            try:
+                if candidate.is_file():
+                    found = candidate
+                    break
+            except OSError:
+                continue          # unreadable folder; try the next one
+        if found:
+            break
+
+    _ASSET_CACHE[names] = found
+    return found
+
+
+def logo_path() -> Path | None:
+    """The image shown in the page header and as the browser tab icon."""
+    return find_asset(LOGO_NAMES)
+
+
+def window_icon_path() -> Path | None:
+    """An icon Windows can actually use for the window and the taskbar."""
+    return find_asset(ICON_NAMES)
+
+
+def lan_url(host: str | None = None, port: int | None = None) -> str:
+    """The address another device on the network should open.
+
+    This is what the QR code encodes, so a phone can be pointed at the laptop
+    without anyone typing an IP address. A link-local address is preferred:
+    it is the one that works on a phone hotspot, where there is no router.
+    """
+    if host is None:
+        host = detect_local_ip() or "localhost"
+    if port is None:
+        port = DEFAULT_PORT
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"        # bare IPv6 in a URL needs brackets
+    return f"http://{host}:{port}/"
 
 
 # ============================ FILENAMES ==============================
@@ -1095,13 +1175,62 @@ class ShareHandler(BaseHTTPRequestHandler):
             self._handle_download(query)
         elif route == "/api/upload":
             self._handle_upload(query)
-        elif route == "/favicon.ico":
-            self._send_bytes(b"", "image/x-icon", send_body=False, status=204)
+        elif route == "/api/qr.svg":
+            self._send_qr(send_body)
+        elif route in ("/logo", "/logo.ico", "/logo.jpg", "/favicon.ico"):
+            self._send_logo(send_body)
         else:
             self._send_json(
                 {"ok": False, "error": "Not found", "path": route},
                 status=404, send_body=send_body,
             )
+
+    def _send_logo(self, send_body: bool) -> None:
+        """
+        Serve the project logo, for the page header and the browser tab.
+
+        A missing logo is not an error worth failing a page load over, so this
+        answers 204 the same way an absent favicon always used to. It stays
+        readable before the PIN is entered, which is what lets the lock screen
+        show the logo too.
+        """
+        path = logo_path()
+        if path is None:
+            self._send_bytes(b"", "image/octet-stream", send_body=send_body,
+                             status=204)
+            return
+
+        try:
+            body = path.read_bytes()
+        except OSError as exc:
+            raise UploadError(500, "Logo unavailable", str(exc)) from exc
+
+        # mimetypes does not always know .ico; say so plainly when it does not.
+        content_type = mimetypes.guess_type(path.name)[0] or "image/x-icon"
+        # Long cache: the logo rarely changes, and the phone reloads the page
+        # often. The name carries a version so a new one is picked up at once.
+        self._send_bytes(body, content_type, send_body=send_body,
+                         extra_headers={"Cache-Control": "public, max-age=86400"})
+
+    def _send_qr(self, send_body: bool) -> None:
+        """
+        A QR code of this machine's LAN address, as an SVG.
+
+        Drawn by the app itself rather than fetched from an image service, so
+        nothing about your network leaves the machine, and the code still works
+        with no internet at all.
+        """
+        import qr
+
+        try:
+            svg = qr.to_svg(lan_url(getattr(self.server, "local_ip", None),
+                                    self.server.server_address[1]))
+        except ValueError as exc:
+            raise UploadError(500, "Could not build the QR code", str(exc)) from exc
+
+        self._send_bytes(svg.encode("utf-8"), "image/svg+xml",
+                         send_body=send_body,
+                         extra_headers={"Cache-Control": "no-store"})
 
     def _handle_download(self, query: dict) -> None:
         """
@@ -1369,9 +1498,15 @@ class ShareHandler(BaseHTTPRequestHandler):
             "data_dir": str(DATA_DIR),
             # How the client reached us - 'localhost' on the laptop,
             # the LAN IP on the phone.
-            "reached_via_host": self.headers.get("Host", "?"),
+            "reached_via_host": self.headers.get("Host") or "?",
             "reached_via_port": host_port or "(default)",
             "client_ip": self.client_address[0],
+            # The address to hand to the other device. This is what the QR
+            # code encodes and what the page shows as a fallback, so both
+            # always agree. Sent here rather than left to the page so a phone
+            # that reached us by one address is told the one worth typing.
+            "lan_url": lan_url(getattr(self.server, "local_ip", None),
+                               self.server.server_address[1]),
             # Which side of the bridge this device is on.
             "sender": identify_sender(self.client_address[0],
                                       getattr(self.server, "local_ip", None)),
@@ -1381,12 +1516,16 @@ class ShareHandler(BaseHTTPRequestHandler):
     # ---- response helpers ----
 
     def _send_bytes(self, payload: bytes, content_type: str, *,
-                    send_body: bool = True, status: int = 200) -> None:
+                    send_body: bool = True, status: int = 200,
+                    extra_headers: dict | None = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         # Always re-fetch: during development the page changes on every step.
+        # Anything that overrides this has a reason to - the logo is stable.
         self.send_header("Cache-Control", "no-store")
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         if send_body and payload:
             self.wfile.write(payload)
@@ -1597,6 +1736,8 @@ PAGE_HTML = r"""
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
 <title>Teleport Share</title>
+<link rel="icon" href="/logo">
+<link rel="apple-touch-icon" href="/logo">
 <style>
   :root {
     --bg: #f4f5f7;
@@ -1634,8 +1775,17 @@ PAGE_HTML = r"""
   .wrap { max-width: 560px; margin: 0 auto; }
   header { display: flex; align-items: center; gap: 10px; margin: 4px 0 18px; }
   h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  /* The logo. Rounded here as well as in the artwork, so it reads as the
+     same shape in the header and in the taskbar. */
+  .logo {
+    width: 40px; height: 40px; flex: none; border-radius: 10px;
+    background: var(--card); object-fit: cover; user-select: none;
+    -webkit-user-drag: none;
+  }
+  /* Two buttons in the header, so only the first one pushes away from the
+     title; the second sits next to it. */
   .iconbtn {
-    margin-left: auto; width: 40px; height: 40px; flex: none;
+    width: 40px; height: 40px; flex: none;
     display: flex; align-items: center; justify-content: center;
     font-size: 19px; line-height: 1; cursor: pointer;
     background: var(--accent-soft); color: var(--accent);
@@ -1644,6 +1794,39 @@ PAGE_HTML = r"""
   }
   .iconbtn:active { transform: scale(.94); }
   .iconbtn[disabled] { opacity: .45; cursor: default; }
+  #qrBtn { margin-left: auto; }
+
+  /* The QR panel: a sheet over the page, so the code is readable at arm's
+     length from the laptop. */
+  .sheet {
+    position: fixed; inset: 0; z-index: 60;
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px; background: rgba(16, 18, 22, .55);
+  }
+  .sheet[hidden] { display: none; }
+  .sheetBox {
+    background: var(--card); color: var(--text);
+    border-radius: 16px; padding: 22px 20px 18px;
+    max-width: 320px; width: 100%; text-align: center;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, .35);
+    max-height: 100%; overflow: auto;
+  }
+  .sheetBox h2 { margin: 0 0 4px; font-size: 18px; }
+  .sheetHint { margin: 0 0 14px; font-size: 13px; color: var(--muted); }
+  .qrImg {
+    display: block; width: 100%; max-width: 260px; height: auto;
+    margin: 0 auto; border-radius: 10px; background: #fff;
+  }
+  /* Written under the code so it can be typed by hand if the camera is no
+     use - a hotspot address is not something to guess at. */
+  .qrUrl {
+    margin: 14px 0 16px; font-size: 13px; color: var(--muted);
+    word-break: break-all; font-family: ui-monospace, Consolas, monospace;
+  }
+  /* Hidden until the address arrives, so the panel never shows an empty gap
+     where a URL belongs. */
+  .qrUrl:empty { display: none; }
+
   .badge { margin-left: 8px; font-size: 12px; font-weight: 600; padding: 4px 10px;
     border-radius: 999px; white-space: nowrap;
     background: var(--accent-soft); color: var(--accent); }
@@ -1880,10 +2063,28 @@ PAGE_HTML = r"""
 
 <div class="wrap">
   <header>
+    <img class="logo" id="logoImg" src="/logo" alt=""
+         width="40" height="40" draggable="false">
     <h1>Teleport Share</h1>
+    <button class="iconbtn" id="qrBtn" aria-label="Show the QR code"
+            title="Show the QR code">&#9741;</button>
     <button class="iconbtn" id="textBtn" aria-label="Send text" title="Send text">&#9998;</button>
     <span class="badge" id="status">connecting&hellip;</span>
   </header>
+
+  <!-- The QR panel. A phone scans this and lands straight on the page, so
+       nobody has to type an IP address. -->
+  <div class="sheet" id="qrSheet" hidden>
+    <div class="sheetBox">
+      <h2>Scan to open</h2>
+      <p class="sheetHint">Point the other device's camera at this.</p>
+      <img class="qrImg" id="qrImg" alt="QR code for this page" width="260"
+           height="260"
+           src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'/%3E">
+      <p class="qrUrl" id="qrUrl"></p>
+      <button class="btn" id="qrClose">Close</button>
+    </div>
+  </div>
 
   <div class="card">
     <h2>Messages</h2>
@@ -2177,6 +2378,48 @@ PAGE_HTML = r"""
   clearBtn.addEventListener('click', function () {
     rows.innerHTML = '';
     clearBtn.disabled = true;
+  });
+
+  // ---- QR code: show this machine's address so a phone can just scan it ----
+  //
+  // The code is drawn by the server, not by a third-party image service, so
+  // the address never leaves the network and it still works offline.
+  var qrBtn = document.getElementById('qrBtn');
+  var qrSheet = document.getElementById('qrSheet');
+  var qrImg = document.getElementById('qrImg');
+  var qrUrl = document.getElementById('qrUrl');
+  var qrClose = document.getElementById('qrClose');
+  var qrLoaded = false;
+
+  function openQr() {
+    qrSheet.hidden = false;
+    if (qrLoaded) return;
+    qrImg.removeAttribute('src');   // blank rather than the old code while loading
+    api('/api/qr.svg').then(function (r) { return r.text(); }).then(function (svg) {
+      // Inline the SVG rather than pointing <img> at it: a data URL keeps it
+      // crisp at any size, and it cannot be re-fetched or tampered with later.
+      qrImg.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svg)));
+      qrLoaded = true;
+    }).catch(function () {
+      qrImg.alt = 'The QR code could not be loaded.';
+    });
+    // Show the address too, so it can be read out or typed by hand. Taken from
+    // the same field the server encodes into the code, so the two can never
+    // disagree.
+    fetch('/api/info').then(function (r) { return r.json(); }).then(function (d) {
+      qrUrl.textContent = d.lan_url;
+    }).catch(function () {});
+  }
+
+  function closeQr() { qrSheet.hidden = true; }
+
+  qrBtn.addEventListener('click', openQr);
+  qrClose.addEventListener('click', closeQr);
+  qrSheet.addEventListener('click', function (e) {
+    if (e.target === qrSheet) closeQr();      // tap the dimmed background
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && !qrSheet.hidden) closeQr();
   });
 
   // ---- text: icon button -> modal -> send ----
@@ -2884,6 +3127,16 @@ def run_gui(argv: list[str] | None = None) -> int:
         show_error(lines.get() if not lines.empty() else "unknown error")
         return 0
     load_page()
+
+    # The window icon goes to webview.start(), not create_window(): pywebview
+    # only accepts `icon` on the start call. Passing it to create_window
+    # raises TypeError and the window never opens at all.
+    #
+    # The .exe already carries the logo as its own icon, which is what the
+    # taskbar shows; this additionally sets the icon on the window itself.
+    icon = window_icon_path()
+    start_kwargs = {"icon": str(icon)} if icon else {}
+
     try:
         webview.create_window(
             "pocket-share",
@@ -2891,7 +3144,7 @@ def run_gui(argv: list[str] | None = None) -> int:
             width=560, height=880, min_size=(420, 520),
             frameless=False, easy_drag=False,
             on_top=False, background_color="#f4f5f7")
-        webview.start()
+        webview.start(**start_kwargs)
     except Exception as exc:  # backend problems must not vanish silently
         show_error(str(exc))
     finally:

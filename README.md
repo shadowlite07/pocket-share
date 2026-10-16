@@ -274,16 +274,22 @@ A quick way to try it before writing any app: run the script in **Termux**
 
 ## Building the .exe yourself
 
+**Double-click `build.bat`.** It checks the inputs are there, installs
+`pyinstaller` and `pywebview` if they are missing, stops any running copy,
+builds, and reports the size. Keeping the flags in one script means they
+cannot drift from what is written here.
+
 Both tools are only needed to **build**. The resulting `.exe` needs neither
-Python nor a browser installed.
+Python nor a browser installed. To run the same command by hand:
 
 ```
 pip install pyinstaller pywebview
 python -m PyInstaller --onefile --noconsole --name pocket-share ^
+    --icon logo.ico --add-data "logo.ico;." ^
     --hidden-import webview teleport_share.py
 ```
 
-Result: `dist/pocket-share.exe` (~38 MB). Note **`--noconsole`** — without it
+Result: `dist/pocket-share.exe` (~35 MB). Note **`--noconsole`** — without it
 you get a console window full of logs instead of an application.
 
 ### How the window works
@@ -296,6 +302,21 @@ is a thin bar at the top with **Start** and **Stop**.
 Because the UI lives in a webview, `pywebview` is the one build-time
 dependency that has no standard-library equivalent. `build/`, `dist/` and the
 generated `.spec` are gitignored.
+
+### The logo and the QR code
+
+`logo.ico` is the only artwork in the project. It holds the logo at seven
+sizes and is used for the browser tab, the page header, the window title bar
+and the taskbar — browsers render `.ico` in an `<img>` just as well as any
+raster, so there is no second copy to keep in step. Drop a `logo.png` or
+`logo.jpg` beside the executable to override it for the web page without
+rebuilding.
+
+The QR code is drawn by `qr.py`, which is part of this project and uses only
+the standard library: there is no `pip install` for it, and the app needs no
+internet to produce one. The code encodes this machine's LAN address, so a
+phone can be pointed at the laptop without anyone typing an IP address. It
+carries a hole in the middle for the logo.
 
 From source:
 
