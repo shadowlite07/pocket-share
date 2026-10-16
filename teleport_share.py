@@ -3070,6 +3070,37 @@ def run_gui(argv: list[str] | None = None) -> int:
   view.src = toApi('/');
   setRunning(true);
 
+  // The shell watches the server itself, rather than trusting the embedded
+  // page to notice. That page is an iframe over a server that may be shut
+  // down underneath it, and when it is it can sit there looking perfectly
+  // normal - files listed, Download buttons live - which reads as "the app is
+  // still working" when nothing is listening at all.
+  //
+  // This page is served by the shell's own server, which keeps running after
+  // a Stop, so it always knows the truth. When the server is down it blanks
+  // the frame instead of leaving a stale copy of the app on screen.
+  var wasRunning = true;
+
+  function syncState() {
+    fetch('/api/state')
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.running === wasRunning) return;
+        wasRunning = d.running;
+        if (d.running) {
+          view.src = toApi('/');
+          setRunning(true);
+        } else {
+          view.src = 'about:blank';     // no stale app left looking usable
+          setRunning(false,
+            'Stopped. Nothing on the network can reach it now.');
+        }
+      })
+      .catch(function () { /* the shell is the server; it cannot be gone */ });
+  }
+
+  setInterval(syncState, 1000);
+
   // Start and stop are posted to THIS page's own origin, which is the shell
   // that wraps the file server. Posting them to the file server's address
   // (toApi) silently did nothing, because it has no such route - that is why
