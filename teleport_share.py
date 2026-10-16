@@ -1832,6 +1832,23 @@ PAGE_HTML = r"""
     background: var(--accent-soft); color: var(--accent); }
   .badge.err { background: var(--danger-soft); color: var(--danger); }
 
+  /* The disconnect notice. Covers the page so nothing on it can be mistaken
+     for something that still works. */
+  .offlineBar {
+    position: fixed; inset: 0; z-index: 90;
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px; background: rgba(16, 18, 22, .72);
+  }
+  .offlineBar[hidden] { display: none; }
+  .offlineBox {
+    background: var(--card); color: var(--text); text-align: center;
+    border-radius: 16px; padding: 26px 22px; max-width: 320px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, .4);
+  }
+  .offlineIcon { font-size: 34px; line-height: 1; color: var(--danger); }
+  .offlineBox h2 { margin: 10px 0 8px; font-size: 18px; }
+  .offlineBox p { margin: 0; font-size: 14px; color: var(--muted); }
+
   /* ---- text modal ---- */
   dialog {
     border: 0; border-radius: 16px; padding: 0; width: min(520px, calc(100vw - 28px));
@@ -2072,7 +2089,18 @@ PAGE_HTML = r"""
     <span class="badge" id="status">connecting&hellip;</span>
   </header>
 
-  <!-- The QR panel. A phone scans this and lands straight on the page, so
+  <!-- Shown when the laptop stops the server. The page itself cannot be closed
+from here, so without this it would just sit there looking normal. -->
+<div class="offlineBar" id="offline" hidden>
+  <div class="offlineBox">
+    <div class="offlineIcon">&#9888;</div>
+    <h2>The laptop stopped sharing</h2>
+    <p>Nothing you do on this page is going anywhere right now. Press
+       <b>Start</b> on the laptop and this will come back on its own.</p>
+  </div>
+</div>
+
+<!-- The QR panel. A phone scans this and lands straight on the page, so
        nobody has to type an IP address. -->
   <div class="sheet" id="qrSheet" hidden>
     <div class="sheetBox">
@@ -2188,6 +2216,9 @@ PAGE_HTML = r"""
       .catch(function (err) {
         pinMsg.textContent = err.message;
         pinInput.value = '';
+        // "Failed to fetch" means the laptop is not there at all, which is
+        // worth showing as a dead page rather than a wrong PIN.
+        if (/fetch|network|load failed/i.test(err.message)) markLost();
         try { pinInput.focus(); } catch (e) {}
       })
       .then(function () { pinGo.disabled = false; });
@@ -2240,6 +2271,35 @@ PAGE_HTML = r"""
     el.textContent = text;
     el.className = isError ? 'badge err' : 'badge';
   }
+
+  // ---- disconnection ----
+  //
+  // The page is already loaded in this browser's memory, so when the laptop
+  // stops the server the page keeps rendering perfectly well - the file list
+  // and messages stay on screen and it looks like everything is still
+  // working. Nothing on the receiving side can be un-loaded, so the only
+  // honest fix is to make it obvious: cover the page, say what happened, and
+  // take the send controls away so nobody believes a file was sent when it
+  // was not.
+  //
+  // It clears itself on its own once the server answers again, so pressing
+  // Start on the laptop brings the page back with no action here.
+  var lost = false;
+
+  function markLost() {
+    if (lost) return;
+    lost = true;
+    document.getElementById('offline').hidden = false;
+  }
+
+  function markBack() {
+    if (!lost) return;
+    lost = false;
+    document.getElementById('offline').hidden = true;
+  }
+
+  // Anything that reaches the server again proves it is alive.
+  function markOnline() { markBack(); }
 
   // ---- one row per file ----
   function addRow(file) {
@@ -2804,10 +2864,11 @@ PAGE_HTML = r"""
       .then(function (d) {
         if (!d.ok) throw new Error('bad response');
         setStatus('connected', false);
+        markOnline();
         isPhone = (d.sender !== 'laptop');
         renderFeed(d.files || []);
       })
-      .catch(function () { setStatus('disconnected', true); });
+      .catch(function () { setStatus('disconnected', true); markLost(); });
   }
 
   function pollAll() {
@@ -2832,6 +2893,7 @@ PAGE_HTML = r"""
     })
     .catch(function () {
       setStatus('disconnected', true);
+      markLost();
     });
   }
 
