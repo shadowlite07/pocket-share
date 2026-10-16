@@ -275,15 +275,28 @@ A quick way to try it before writing any app: run the script in **Termux**
 ## Building the .exe yourself
 
 PyInstaller is only needed to build, never to run — the resulting `.exe` is
-self-contained.
+self-contained and needs no Python installed.
 
 ```
 pip install pyinstaller
-python -m PyInstaller --onefile --name pocket-share --console teleport_share.py
+python -m PyInstaller --onefile --noconsole --name pocket-share teleport_share.py
 ```
 
-The result is `dist/pocket-share.exe` (~9 MB). `build/`, `dist/` and the
-generated `.spec` are gitignored.
+The result is `dist/pocket-share.exe` (~12 MB). Note **`--noconsole`**: without
+it the app is a console window full of logs rather than an application.
+`build/`, `dist/` and the generated `.spec` are gitignored.
+
+Run it from source either way:
+
+```
+python teleport_share.py            # text version
+python teleport_share.py --gui      # same window the .exe shows
+```
+
+The window shows both addresses with Open and Copy buttons, reveals the PIN on
+demand, opens the data folder, and streams live activity so you can see
+transfers happening. Stop and Start work, and closing the window stops the
+server.
 
 ## License
 

@@ -46,6 +46,34 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
+
+class _NullStream:
+    """
+    Stands in for stdout/stderr in a windowed .exe.
+
+    A PyInstaller --noconsole build has no console attached, and Python sets
+    sys.stdout to None. Without this, the first print() anywhere would raise
+    AttributeError and the app would die before showing its window.
+    """
+
+    def write(self, text: str) -> int:
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def reconfigure(self, **kwargs) -> None:
+        pass
+
+    def isatty(self) -> bool:
+        return False
+
+
+if sys.stdout is None:
+    sys.stdout = _NullStream()
+if sys.stderr is None:
+    sys.stderr = _NullStream()
+
 # ============================== CONFIG ==============================
 # Everything you are likely to want to change lives in this block.
 
@@ -2605,8 +2633,312 @@ PAGE_HTML = r"""
 
 
 
+# ================================= GUI ================================
+# The windowed front end. This is what the .exe shows: the server running in a
+# background thread, with the two addresses and the PIN on screen. Keeping it
+# in the same file means there is still only one script to copy around.
+
+
+def run_gui(argv: list[str] | None = None) -> int:
+    """Open the window and run until it is closed."""
+    import queue
+    import threading
+    import tkinter as tk
+    import webbrowser
+    from tkinter import ttk
+
+    class LogBridge:
+        """Redirect the server's console output into the window.
+
+        Without this the app looks broken: files would move silently and you
+        would have no way to tell whether anything reached the phone.
+        """
+
+        def __init__(self, sink: "queue.Queue[list[str]]") -> None:
+            self.sink = sink
+
+        def write(self, text: str) -> int:
+            for line in text.splitlines():
+                if line.strip():
+                    self.sink.put(line)
+            return len(text)
+
+        def flush(self) -> None:
+            pass
+
+        def reconfigure(self, **kwargs) -> None:
+            pass
+
+        def isatty(self) -> bool:
+            return False
+
+    class App:
+        def __init__(self) -> None:
+            self.root = tk.Tk()
+            self.root.title(APP_NAME)
+            self.root.minsize(560, 600)
+            self.root.protocol("WM_DELETE_WINDOW", self.quit)
+
+            self.server = None
+            self.thread = None
+            self.local_ip = ""
+            self.port = DEFAULT_PORT
+            self.pin_hidden = ""
+            self.pin_shown = False
+            self._closing = False
+            self._saved_stdout = None
+            self.lines: "queue.Queue[list[str]]" = queue.Queue()
+
+            self._style(ttk)
+            self._layout(tk, ttk)
+            self._pump()
+            self.root.after(120, self.start)
+
+        # ---- layout ----
+
+        def _style(self, ttk) -> None:
+            style = ttk.Style()
+            for theme in ("vista", "clam"):
+                try:
+                    style.theme_use(theme)
+                    break
+                except tk.TclError:
+                    continue
+            style.configure("Head.TLabel", font=("Segoe UI", 16, "bold"))
+            style.configure("Sub.TLabel", foreground="#666666")
+            style.configure("Url.TLabel", font=("Consolas", 11))
+            style.configure("Pill.TLabel", font=("Segoe UI", 9, "bold"),
+                            foreground="#1f7a3f")
+            style.configure("PillOff.TLabel", font=("Segoe UI", 9, "bold"),
+                            foreground="#c0392b")
+            style.configure("Big.TButton", font=("Segoe UI", 10, "bold"))
+
+        def _layout(self, tk, ttk) -> None:
+            pad = ttk.Frame(self.root, padding=18)
+            pad.grid(row=0, column=0, sticky="nsew")
+            self.root.rowconfigure(0, weight=1)
+            self.root.columnconfigure(0, weight=1)
+            pad.columnconfigure(0, weight=1)
+
+            head = ttk.Frame(pad)
+            head.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+            head.columnconfigure(0, weight=1)
+            ttk.Label(head, text=APP_NAME,
+                      style="Head.TLabel").grid(row=0, column=0, sticky="w")
+            self.status = ttk.Label(head, text="starting...",
+                                    style="PillOff.TLabel")
+            self.status.grid(row=0, column=1, sticky="e")
+
+            row = ttk.Frame(pad)
+            row.grid(row=1, column=0, sticky="w", pady=(0, 10))
+            self.start_btn = ttk.Button(row, text="Start", style="Big.TButton",
+                                        command=self.start)
+            self.start_btn.grid(row=0, column=0)
+            self.stop_btn = ttk.Button(row, text="Stop", command=self.stop,
+                                       state="disabled")
+            self.stop_btn.grid(row=0, column=1, padx=(8, 0))
+
+            self.local_url = self._url_row(pad, ttk, 2, "On this laptop", "")
+            self.phone_url = self._url_row(pad, ttk, 3,
+                                           "On the phone (same Wi-Fi)", "")
+
+            info = ttk.Frame(pad)
+            info.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+            info.columnconfigure(1, weight=1)
+
+            ttk.Label(info, text="PIN", style="Sub.TLabel").grid(
+                row=0, column=0, sticky="w")
+            pinbox = ttk.Frame(info)
+            pinbox.grid(row=0, column=1, sticky="w")
+            self.pin_var = tk.StringVar()
+            ttk.Label(pinbox, textvariable=self.pin_var,
+                      style="Url.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Button(pinbox, text="Show", width=6,
+                       command=self.toggle_pin).grid(row=0, column=1, padx=(8, 0))
+
+            ttk.Label(info, text="Files", style="Sub.TLabel").grid(
+                row=1, column=0, sticky="w", pady=(6, 0))
+            self.folder_var = tk.StringVar()
+            ttk.Label(info, textvariable=self.folder_var,
+                      style="Sub.TLabel").grid(row=1, column=1, sticky="w",
+                                               pady=(6, 0))
+            ttk.Button(info, text="Open", width=6,
+                       command=self.open_folder).grid(row=1, column=2, padx=(8, 0),
+                                                      pady=(6, 0))
+
+            ttk.Label(pad, text="Activity", style="Sub.TLabel").grid(
+                row=5, column=0, sticky="w", pady=(16, 6))
+            frame = ttk.Frame(pad)
+            frame.grid(row=6, column=0, sticky="nsew")
+            frame.rowconfigure(0, weight=1)
+            frame.columnconfigure(0, weight=1)
+            pad.rowconfigure(6, weight=1)
+
+            self.log = tk.Text(frame, height=13, wrap="none", state="disabled",
+                               bg="#fbfbfc", relief="flat", padx=8, pady=6)
+            self.log.grid(row=0, column=0, sticky="nsew")
+            bar = ttk.Scrollbar(frame, orient="vertical",
+                                command=self.log.yview)
+            bar.grid(row=0, column=1, sticky="ns")
+            self.log.configure(yscrollcommand=bar.set)
+
+        def _url_row(self, parent, ttk, row, caption, url):
+            box = ttk.Frame(parent)
+            box.grid(row=row, column=0, sticky="ew", pady=6)
+            box.columnconfigure(1, weight=1)
+            ttk.Label(box, text=caption, style="Sub.TLabel").grid(
+                row=0, column=0, sticky="w")
+            label = ttk.Label(box, text=url, style="Url.TLabel")
+            label.grid(row=1, column=0, sticky="w", pady=(2, 0))
+            ttk.Button(box, text="Open", width=6,
+                       command=lambda: self.open_page(label.cget("text"))
+                       ).grid(row=1, column=1, sticky="e", padx=(10, 0))
+            ttk.Button(box, text="Copy", width=6,
+                       command=lambda: self.copy(label.cget("text"))
+                       ).grid(row=1, column=2)
+            return label
+
+        # ---- server control ----
+
+        def start(self) -> None:
+            if self.server:
+                return
+            ensure_env_file(ENV_FILE)
+            env = load_env_file(ENV_FILE)
+            if "PIN" in env:
+                globals()["PIN"] = env["PIN"].strip()
+                source = ENV_FILE.name
+            else:
+                source = "built-in default"
+
+            self.pin_hidden = "•" * len(PIN) if PIN else "(switched off)"
+            self.pin_shown = False
+            self.pin_var.set(self.pin_hidden)
+            self.folder_var.set(str(DATA_DIR))
+
+            # Capture the real console once only: after a Stop/Start cycle
+            # sys.stdout is already the previous bridge, and saving that would
+            # restore the bridge on exit instead of the console.
+            if self._saved_stdout is None:
+                self._saved_stdout = sys.stdout
+            sys.stdout = LogBridge(self.lines)
+
+            try:
+                server, detected_ip, _store, _stale = build_server(
+                    BIND_ADDRESS, DEFAULT_PORT)
+            except OSError as exc:
+                sys.stdout = self._saved_stdout
+                self._set_status("could not start", False)
+                self.lines.put(f"ERROR: {exc}")
+                self.start_btn.config(state="normal")
+                return
+
+            self.server = server
+            self.local_ip = detected_ip
+            self.port = server.server_address[1]
+            self.thread = threading.Thread(target=server.serve_forever,
+                                           daemon=True)
+            self.thread.start()
+
+            self.local_url.config(text=f"http://localhost:{self.port}")
+            self.phone_url.config(text=f"http://{detected_ip}:{self.port}"
+                                  if detected_ip else "could not detect")
+            self._set_status("running", True)
+            self.start_btn.config(state="disabled")
+            self.stop_btn.config(state="normal")
+            self.lines.put(f"Listening on port {self.port}  (PIN from {source})")
+
+        def stop(self) -> None:
+            """Stop button - main thread, so it may touch widgets."""
+            if not self.server:
+                return
+            self.stop_btn.config(state="disabled")
+            self._set_status("stopping", False)
+            self.shutdown_server()
+            self._set_status("stopped", False)
+            self.start_btn.config(state="normal")
+            self.stop_btn.config(state="disabled")
+            self.local_url.config(text=f"http://localhost:{self.port}")
+            self.phone_url.config(text="")
+
+        def shutdown_server(self) -> None:
+            """Stop the server without touching a widget.
+
+            tkinter may only be driven from the thread that created the
+            window, so closing the app cannot do this on a worker.
+            """
+            if not self.server:
+                return
+            self.lines.put("Stopping...")
+            try:
+                self.server.shutdown()
+            finally:
+                self.server.server_close()
+                self.server = None
+
+        def quit(self) -> None:
+            self._closing = True
+            self.shutdown_server()
+            if self._saved_stdout is not None:
+                sys.stdout = self._saved_stdout
+            self.root.destroy()
+
+        def _set_status(self, text: str, running: bool) -> None:
+            self.status.config(
+                text=text, style="Pill.TLabel" if running else "PillOff.TLabel")
+
+        # ---- helpers ----
+
+        def toggle_pin(self) -> None:
+            self.pin_shown = not self.pin_shown
+            self.pin_var.set(PIN if self.pin_shown else self.pin_hidden)
+
+        def copy(self, text: str) -> None:
+            if not text:
+                return
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.lines.put(f"Copied {text}")
+
+        def open_page(self, url: str) -> None:
+            if url and url.startswith("http"):
+                webbrowser.open(url)
+
+        def open_folder(self) -> None:
+            try:
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                os.startfile(DATA_DIR)  # noqa: S606 - Windows only, by design
+            except (OSError, AttributeError) as exc:
+                self.lines.put(f"Could not open the folder: {exc}")
+
+        def _pump(self) -> None:
+            """Move queued log lines into the text box."""
+            if self._closing:
+                return
+            try:
+                while True:
+                    line = self.lines.get_nowait()
+                    self.log.config(state="normal")
+                    self.log.insert("end", line.rstrip() + "\n")
+                    self.log.see("end")
+                    self.log.config(state="disabled")
+            except queue.Empty:
+                pass
+            self.root.after(250, self._pump)
+
+    args = parse_args(argv)
+    App().root.mainloop()
+    return 0
+
+
 # ============================== ENTRY POINT ==============================
 # main() serves PAGE_HTML, so the page string has to exist before the first
 # request can arrive - which is why this stays at the very bottom of the file.
 if __name__ == "__main__":
+    argv = sys.argv[1:]
+    wants_window = "--gui" in argv or "--window" in argv
+    # A windowed .exe has no console to print to, so with no arguments it must
+    # open a window. --cli forces the text version back on.
+    if wants_window or (getattr(sys, "frozen", False) and "--cli" not in argv):
+        sys.exit(run_gui())
     sys.exit(main())
