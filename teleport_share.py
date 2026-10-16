@@ -1553,10 +1553,56 @@ class ShareHandler(BaseHTTPRequestHandler):
 class ShareServer(ThreadingHTTPServer):
     # Daemon threads so Ctrl+C shuts down immediately instead of hanging.
     daemon_threads = True
+    # ...which would otherwise make server_close() wait for every handler
+    # thread. Those threads sit in readline() on an idle keep-alive
+    # connection, so it would block until the phone happened to disconnect.
+    # We close connections ourselves instead - see close_connections().
+    block_on_close = False
     # We set the socket options ourselves in server_bind(); leaving this True
     # lets the base class set SO_REUSEADDR, which on Windows cancels out
     # SO_EXCLUSIVEADDRUSE and lets a second copy bind the same port.
     allow_reuse_address = False
+
+    def __init__(self, *args, **kwargs) -> None:
+        # Every connection currently being served, so a Stop can cut them.
+        self._live: set = set()
+        self._live_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    def process_request_thread(self, request, client_address) -> None:
+        with self._live_lock:
+            self._live.add(request)
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._live_lock:
+                self._live.discard(request)
+
+    def close_connections(self) -> int:
+        """
+        Cut every connection that is currently open. Returns how many.
+
+        This is the part that actually makes Stop mean something. shutdown()
+        stops new connections and server_close() closes the listening socket,
+        but a connection the phone already opened keeps its own thread and,
+        under HTTP/1.1, keeps answering request after request on it. Left
+        alone, a phone that had the page open would go on uploading long
+        after the server was supposed to be off - which is exactly what
+        happened.
+        """
+        with self._live_lock:
+            live = list(self._live)
+            self._live.clear()
+        for connection in live:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass          # already gone, which is the desired end state
+            try:
+                connection.close()
+            except OSError:
+                pass
+        return len(live)
 
     def handle_error(self, request, client_address) -> None:
         """
@@ -3284,12 +3330,20 @@ def run_gui(argv: list[str] | None = None) -> int:
                 server.shutdown()
             except Exception as exc:       # noqa: BLE001
                 log(f"(shutdown reported {exc})")
-            finally:
-                try:
-                    server.server_close()
-                except Exception as exc:   # noqa: BLE001
-                    log(f"(close reported {exc})")
-                log("Stopped. Nothing is listening on the network now.")
+            try:
+                server.server_close()
+            except Exception as exc:       # noqa: BLE001
+                log(f"(close reported {exc})")
+            # Cut the connections the phone already had open. Without this
+            # they keep serving requests and the laptop goes on receiving
+            # files long after Stop.
+            try:
+                cut = server.close_connections()
+                if cut:
+                    log(f"Closed {cut} open connection(s).")
+            except Exception as exc:       # noqa: BLE001
+                log(f"(close connections reported {exc})")
+            log("Stopped. Nothing on the network can reach it now.")
 
     def show_error(message: str) -> None:
         """A windowed build has no console, so errors have to be shown."""
