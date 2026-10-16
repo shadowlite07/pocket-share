@@ -3070,6 +3070,11 @@ def run_gui(argv: list[str] | None = None) -> int:
            border:1px solid var(--line); background:var(--bg);
            color:var(--muted); cursor:pointer;
            -webkit-tap-highlight-color:transparent; }
+  /* The PIN, once revealed. Shown here because the app generates one on
+     first run and there is nowhere else to look for it. */
+  .pin { font:600 13px ui-monospace, Consolas, monospace; color:var(--accent);
+         letter-spacing:.08em; }
+  .pin[hidden] { display:none; }
   button:disabled { opacity:.45; cursor:default; }
   button.go { background:var(--accent); border-color:var(--accent);
              color:#fff; }
@@ -3082,7 +3087,9 @@ def run_gui(argv: list[str] | None = None) -> int:
   <div id="bar">
     <span class="dot" id="dot"></span>
     <span class="t">pocket-share</span>
+    <span class="pin" id="pinOut" hidden></span>
     <span class="grow"></span>
+    <button id="pinBtn" title="Show the PIN">PIN</button>
     <button id="start" class="go" disabled>Start</button>
     <button id="stop">Stop</button>
   </div>
@@ -3094,7 +3101,22 @@ def run_gui(argv: list[str] | None = None) -> int:
   var dot      = document.getElementById('dot');
   var view     = document.getElementById('view');
   var note     = document.getElementById('note');
+  var pinBtn  = document.getElementById('pinBtn');
+  var pinOut  = document.getElementById('pinOut');
   var PORT = __PORT__;
+
+  // The PIN is generated on first run and lives in .env beside the .exe.
+  // Show it on demand rather than making anyone dig through a hidden file.
+  pinBtn.addEventListener('click', function () {
+    if (!pinOut.hidden) { pinOut.hidden = true; return; }
+    fetch('/api/pin').then(function (r) { return r.json(); }).then(function (d) {
+      pinOut.textContent = d.pin ? 'PIN ' + d.pin : 'no PIN set';
+      pinOut.hidden = false;
+    }).catch(function () {
+      pinOut.textContent = 'could not read the PIN';
+      pinOut.hidden = false;
+    });
+  });
 
   function toApi(path) {
     // The bar page is served from a data/blob URL, so it reaches the server
@@ -3218,6 +3240,13 @@ def run_gui(argv: list[str] | None = None) -> int:
                 if route == "/api/state":
                     self._send_json({"running": bool(state["server"]),
                                      "port": state["port"]})
+                    return
+                if route == "/api/pin":
+                    # Only ever reachable from this window, which is served on
+                    # 127.0.0.1 and is not bound to the network. Without this
+                    # there is no way to recover a PIN the app generated on
+                    # first run without opening .env in a text editor.
+                    self._send_json({"pin": PIN})
                     return
                 self._send(BAR_HTML.replace("__PORT__", str(state["port"]))
                            .encode("utf-8"), "text/html; charset=utf-8")
