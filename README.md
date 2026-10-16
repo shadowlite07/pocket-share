@@ -10,6 +10,19 @@ open the same web page.
 - **Local network only.** Nothing leaves your hotspot; nothing is uploaded to
   any cloud service.
 
+## Get it
+
+**Download the latest `pocket-share.exe` from
+[Releases](https://github.com/shadowlite07/pocket-share/releases) and double-click it.**
+
+That is the whole setup — no Python required on your machine. The release page
+covers the PIN, the firewall prompt and everything else you need to know, so
+there is no reason to read the rest of this file unless you want to build it
+yourself.
+
+<details>
+<summary>Building from source</summary>
+
 ## Why
 
 You are on a hotspot, your phone's battery is low, and you need to move a photo
@@ -19,13 +32,10 @@ one URL.
 
 ## Requirements
 
-Python 3.9+ on Windows. Nothing else.
+Python 3.9+ on Windows. Nothing else. (Only if building from source — the
+release `.exe` needs neither.)
 
 ## Run it
-
-**As a standalone app** — download `pocket-share.exe` and double-click it. No
-Python needed on that machine. It keeps its `SharedFiles` folder and its `.env`
-right next to the executable.
 
 **From source:**
 
@@ -324,6 +334,8 @@ From source:
 python teleport_share.py            # text version, no dependencies at all
 python teleport_share.py --gui      # the window (needs pywebview)
 ```
+
+</details>
 
 ## License
 
