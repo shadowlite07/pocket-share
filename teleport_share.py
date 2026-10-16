@@ -2634,24 +2634,32 @@ PAGE_HTML = r"""
 
 
 # ================================= GUI ================================
-# The windowed front end. This is what the .exe shows: the server running in a
-# background thread, with the two addresses and the PIN on screen. Keeping it
-# in the same file means there is still only one script to copy around.
+# The windowed front end. This is what the .exe shows.
+#
+# The window IS the web app: the very same page that the laptop and phone
+# get, embedded in a native window through pywebview. Nothing here
+# reimplements the UI, so there is no second copy to keep in step. The only
+# things added around it are Start and Stop.
+#
+# pywebview drives the Edge WebView2 runtime, which is already installed on
+# Windows 10/11 - so the built .exe needs no Python and no browser download.
+
+_WINDOW_BAR = 34  # room for the Start/Stop strip along the top
 
 
 def run_gui(argv: list[str] | None = None) -> int:
     """Open the window and run until it is closed."""
     import queue
     import threading
-    import tkinter as tk
     import webbrowser
-    from tkinter import ttk
+
+    import webview
 
     class LogBridge:
-        """Redirect the server's console output into the window.
+        """Redirect the server's console output so errors are visible.
 
-        Without this the app looks broken: files would move silently and you
-        would have no way to tell whether anything reached the phone.
+        A --noconsole build has no console to print to, so anything that goes
+        wrong would otherwise be completely silent.
         """
 
         def __init__(self, sink: "queue.Queue[list[str]]") -> None:
@@ -2672,262 +2680,222 @@ def run_gui(argv: list[str] | None = None) -> int:
         def isatty(self) -> bool:
             return False
 
-    class App:
-        def __init__(self) -> None:
-            self.root = tk.Tk()
-            self.root.title(APP_NAME)
-            self.root.minsize(560, 600)
-            self.root.protocol("WM_DELETE_WINDOW", self.quit)
+    state = {"server": None, "thread": None, "closing": False, "port": 0}
+    lines: "queue.Queue[list[str]]" = queue.Queue()
+    webview_window = None
 
-            self.server = None
-            self.thread = None
-            self.local_ip = ""
-            self.port = DEFAULT_PORT
-            self.pin_hidden = ""
-            self.pin_shown = False
-            self._closing = False
-            self._saved_stdout = None
-            self.lines: "queue.Queue[list[str]]" = queue.Queue()
+    def log(message: str) -> None:
+        lines.put(str(message))
 
-            self._style(ttk)
-            self._layout(tk, ttk)
-            self._pump()
-            self.root.after(120, self.start)
+    # ---- the page that carries the Start/Stop controls ----
+    #
+    # It is served by our own server and styled to match the app, so the strip
+    # does not look bolted on. The webview loads this instead of "/" and then
+    # swaps to the real UI once the server is up.
+    BAR_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+  :root { --bg:#f4f5f7; --card:#fff; --line:#e3e6ea; --muted:#666e7a;
+          --accent:#1f7a3f; --accent-soft:#e6f4ea; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14161a; --card:#1d2026; --line:#2c313a; --muted:#9aa3af;
+            --accent:#4ec97e; --accent-soft:#16301f; }
+  }
+  * { box-sizing:border-box; -webkit-text-size-adjust:100%; }
+  body { margin:0; height:100vh; display:flex; flex-direction:column;
+         background:var(--bg); color:#16181d;
+         font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  @media (prefers-color-scheme: dark) { body { color:#eef1f4; } }
+  #bar { display:flex; align-items:center; gap:10px; padding:10px 14px;
+         background:var(--card); border-bottom:1px solid var(--line);
+         flex:none; }
+  .t { font-weight:700; font-size:14px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--accent);
+         margin-right:2px; }
+  .dot.off { background:#c0392b; }
+  .grow { flex:1; }
+  button { font:600 12px inherit; padding:7px 15px; border-radius:8px;
+           border:1px solid var(--line); background:var(--bg);
+           color:var(--muted); cursor:pointer;
+           -webkit-tap-highlight-color:transparent; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.go { background:var(--accent); border-color:var(--accent);
+             color:#fff; }
+  #view { flex:1; border:0; width:100%; background:var(--bg); }
+  #note { padding:10px 14px; color:var(--muted); font-size:12px;
+          background:var(--card); border-top:1px solid var(--line);
+          flex:none; }
+</style></head>
+<body>
+  <div id="bar">
+    <span class="dot" id="dot"></span>
+    <span class="t">pocket-share</span>
+    <span class="grow"></span>
+    <button id="start" class="go" disabled>Start</button>
+    <button id="stop">Stop</button>
+  </div>
+  <iframe id="view" src="about:blank"></iframe>
+  <div id="note">Loading...</div>
+<script>
+  var startBtn = document.getElementById('start');
+  var stopBtn  = document.getElementById('stop');
+  var dot      = document.getElementById('dot');
+  var view     = document.getElementById('view');
+  var note     = document.getElementById('note');
+  var PORT = __PORT__;
 
-        # ---- layout ----
+  function toApi(path) {
+    // The bar page is served from a data/blob URL, so it reaches the server
+    // on its own origin. Same-origin from localhost:PORT is allowed.
+    return 'http://localhost:' + PORT + path;
+  }
 
-        def _style(self, ttk) -> None:
-            style = ttk.Style()
-            for theme in ("vista", "clam"):
-                try:
-                    style.theme_use(theme)
-                    break
-                except tk.TclError:
-                    continue
-            style.configure("Head.TLabel", font=("Segoe UI", 16, "bold"))
-            style.configure("Sub.TLabel", foreground="#666666")
-            style.configure("Url.TLabel", font=("Consolas", 11))
-            style.configure("Pill.TLabel", font=("Segoe UI", 9, "bold"),
-                            foreground="#1f7a3f")
-            style.configure("PillOff.TLabel", font=("Segoe UI", 9, "bold"),
-                            foreground="#c0392b")
-            style.configure("Big.TButton", font=("Segoe UI", 10, "bold"))
+  function setRunning(running, msg) {
+    dot.className = running ? 'dot' : 'dot off';
+    startBtn.disabled = running;
+    stopBtn.disabled = !running;
+    note.textContent = msg || (running
+      ? 'Running. The page above is the same one your phone sees.'
+      : 'Stopped.');
+  }
 
-        def _layout(self, tk, ttk) -> None:
-            pad = ttk.Frame(self.root, padding=18)
-            pad.grid(row=0, column=0, sticky="nsew")
-            self.root.rowconfigure(0, weight=1)
-            self.root.columnconfigure(0, weight=1)
-            pad.columnconfigure(0, weight=1)
+  // The server is already running by the time this window opens, so show the
+  // app straight away rather than making the user press Start first.
+  view.src = toApi('/');
+  setRunning(true);
 
-            head = ttk.Frame(pad)
-            head.grid(row=0, column=0, sticky="ew", pady=(0, 14))
-            head.columnconfigure(0, weight=1)
-            ttk.Label(head, text=APP_NAME,
-                      style="Head.TLabel").grid(row=0, column=0, sticky="w")
-            self.status = ttk.Label(head, text="starting...",
-                                    style="PillOff.TLabel")
-            self.status.grid(row=0, column=1, sticky="e")
+  startBtn.addEventListener('click', function () {
+    startBtn.disabled = true;
+    note.textContent = 'Starting...';
+    view.src = toApi('/');
+    setRunning(true);
+  });
 
-            row = ttk.Frame(pad)
-            row.grid(row=1, column=0, sticky="w", pady=(0, 10))
-            self.start_btn = ttk.Button(row, text="Start", style="Big.TButton",
-                                        command=self.start)
-            self.start_btn.grid(row=0, column=0)
-            self.stop_btn = ttk.Button(row, text="Stop", command=self.stop,
-                                       state="disabled")
-            self.stop_btn.grid(row=0, column=1, padx=(8, 0))
+  stopBtn.addEventListener('click', function () {
+    // Ask the server to close itself down; the window follows shortly after.
+    fetch(toApi('/api/shutdown'), { method: 'POST' }).catch(function () {});
+    setRunning(false, 'Stopped. Close the window to exit.');
+  });
+</script>
+</body></html>"""
 
-            self.local_url = self._url_row(pad, ttk, 2, "On this laptop", "")
-            self.phone_url = self._url_row(pad, ttk, 3,
-                                           "On the phone (same Wi-Fi)", "")
+    def load_page() -> None:
+        """Serve the bar page over loopback and hand its URL to the webview."""
+        nonlocal webview_window
+        import http.server
+        import socketserver
+        import threading as th
 
-            info = ttk.Frame(pad)
-            info.grid(row=4, column=0, sticky="ew", pady=(14, 0))
-            info.columnconfigure(1, weight=1)
+        port = 0
 
-            ttk.Label(info, text="PIN", style="Sub.TLabel").grid(
-                row=0, column=0, sticky="w")
-            pinbox = ttk.Frame(info)
-            pinbox.grid(row=0, column=1, sticky="w")
-            self.pin_var = tk.StringVar()
-            ttk.Label(pinbox, textvariable=self.pin_var,
-                      style="Url.TLabel").grid(row=0, column=0, sticky="w")
-            ttk.Button(pinbox, text="Show", width=6,
-                       command=self.toggle_pin).grid(row=0, column=1, padx=(8, 0))
+        class BarHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
 
-            ttk.Label(info, text="Files", style="Sub.TLabel").grid(
-                row=1, column=0, sticky="w", pady=(6, 0))
-            self.folder_var = tk.StringVar()
-            ttk.Label(info, textvariable=self.folder_var,
-                      style="Sub.TLabel").grid(row=1, column=1, sticky="w",
-                                               pady=(6, 0))
-            ttk.Button(info, text="Open", width=6,
-                       command=self.open_folder).grid(row=1, column=2, padx=(8, 0),
-                                                      pady=(6, 0))
+            def log_message(self, *args) -> None:
+                pass  # quiet: the window has its own notes line
 
-            ttk.Label(pad, text="Activity", style="Sub.TLabel").grid(
-                row=5, column=0, sticky="w", pady=(16, 6))
-            frame = ttk.Frame(pad)
-            frame.grid(row=6, column=0, sticky="nsew")
-            frame.rowconfigure(0, weight=1)
-            frame.columnconfigure(0, weight=1)
-            pad.rowconfigure(6, weight=1)
+            def _send(self, body: bytes, ctype: str) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
 
-            self.log = tk.Text(frame, height=13, wrap="none", state="disabled",
-                               bg="#fbfbfc", relief="flat", padx=8, pady=6)
-            self.log.grid(row=0, column=0, sticky="nsew")
-            bar = ttk.Scrollbar(frame, orient="vertical",
-                                command=self.log.yview)
-            bar.grid(row=0, column=1, sticky="ns")
-            self.log.configure(yscrollcommand=bar.set)
+            def do_GET(self) -> None:
+                if self.path.startswith("/api/shutdown"):
+                    threading.Thread(target=_stop, daemon=True).start()
+                    self._send(b'{"ok":true}', "application/json")
+                    return
+                self._send(BAR_HTML.replace("__PORT__", str(state["port"]))
+                           .encode("utf-8"), "text/html; charset=utf-8")
 
-        def _url_row(self, parent, ttk, row, caption, url):
-            box = ttk.Frame(parent)
-            box.grid(row=row, column=0, sticky="ew", pady=6)
-            box.columnconfigure(1, weight=1)
-            ttk.Label(box, text=caption, style="Sub.TLabel").grid(
-                row=0, column=0, sticky="w")
-            label = ttk.Label(box, text=url, style="Url.TLabel")
-            label.grid(row=1, column=0, sticky="w", pady=(2, 0))
-            ttk.Button(box, text="Open", width=6,
-                       command=lambda: self.open_page(label.cget("text"))
-                       ).grid(row=1, column=1, sticky="e", padx=(10, 0))
-            ttk.Button(box, text="Copy", width=6,
-                       command=lambda: self.copy(label.cget("text"))
-                       ).grid(row=1, column=2)
-            return label
+            def do_POST(self) -> None:
+                if self.path.startswith("/api/shutdown"):
+                    threading.Thread(target=_stop, daemon=True).start()
+                self._send(b'{"ok":true}', "application/json")
 
-        # ---- server control ----
+        httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), BarHandler)
+        httpd.daemon_threads = True
+        port = httpd.server_address[1]
+        th.Thread(target=httpd.serve_forever, daemon=True).start()
+        webview_window = f"http://127.0.0.1:{port}/"
+        log(f"Window shell on {webview_window}")
 
-        def start(self) -> None:
-            if self.server:
-                return
-            ensure_env_file(ENV_FILE)
-            env = load_env_file(ENV_FILE)
-            if "PIN" in env:
-                globals()["PIN"] = env["PIN"].strip()
-                source = ENV_FILE.name
-            else:
-                source = "built-in default"
+    def _start_server() -> bool:
+        if state["server"]:
+            return True
+        ensure_env_file(ENV_FILE)
+        env = load_env_file(ENV_FILE)
+        if "PIN" in env:
+            globals()["PIN"] = env["PIN"].strip()
+            source = ENV_FILE.name
+        else:
+            source = "the built-in default"
 
-            self.pin_hidden = "•" * len(PIN) if PIN else "(switched off)"
-            self.pin_shown = False
-            self.pin_var.set(self.pin_hidden)
-            self.folder_var.set(str(DATA_DIR))
+        sys.stdout = LogBridge(lines)
+        try:
+            server, detected_ip, _store, _stale = build_server(
+                BIND_ADDRESS, DEFAULT_PORT)
+        except OSError as exc:
+            log(f"ERROR: {exc}")
+            return False
 
-            # Capture the real console once only: after a Stop/Start cycle
-            # sys.stdout is already the previous bridge, and saving that would
-            # restore the bridge on exit instead of the console.
-            if self._saved_stdout is None:
-                self._saved_stdout = sys.stdout
-            sys.stdout = LogBridge(self.lines)
+        state["server"] = server
+        state["port"] = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        log(f"Listening on port {state['port']}  (PIN from {source})")
+        return True
 
-            try:
-                server, detected_ip, _store, _stale = build_server(
-                    BIND_ADDRESS, DEFAULT_PORT)
-            except OSError as exc:
-                sys.stdout = self._saved_stdout
-                self._set_status("could not start", False)
-                self.lines.put(f"ERROR: {exc}")
-                self.start_btn.config(state="normal")
-                return
+    def _stop() -> None:
+        """Stop the server. No widgets touched - this can run off-thread."""
+        server = state["server"]
+        if not server:
+            return
+        state["closing"] = True
+        log("Stopping...")
+        try:
+            server.shutdown()
+        finally:
+            server.server_close()
+            state["server"] = None
 
-            self.server = server
-            self.local_ip = detected_ip
-            self.port = server.server_address[1]
-            self.thread = threading.Thread(target=server.serve_forever,
-                                           daemon=True)
-            self.thread.start()
+    def show_error(message: str) -> None:
+        """A windowed build has no console, so errors have to be shown."""
+        import html as html_mod
+        try:
+            webview.create_window(
+                "pocket-share - could not start",
+                html=f"<body style='font:14px system-ui;padding:28px;"
+                     f"background:#f4f5f7;color:#16181d'>"
+                     f"<h3 style='margin:0 0 8px'>Could not start the server</h3>"
+                     f"<p style='color:#666'>{html_mod.escape(message)}</p>"
+                     f"</body>",
+                width=520, height=260)
+            webview.start()
+        except Exception:
+            pass
 
-            self.local_url.config(text=f"http://localhost:{self.port}")
-            self.phone_url.config(text=f"http://{detected_ip}:{self.port}"
-                                  if detected_ip else "could not detect")
-            self._set_status("running", True)
-            self.start_btn.config(state="disabled")
-            self.stop_btn.config(state="normal")
-            self.lines.put(f"Listening on port {self.port}  (PIN from {source})")
-
-        def stop(self) -> None:
-            """Stop button - main thread, so it may touch widgets."""
-            if not self.server:
-                return
-            self.stop_btn.config(state="disabled")
-            self._set_status("stopping", False)
-            self.shutdown_server()
-            self._set_status("stopped", False)
-            self.start_btn.config(state="normal")
-            self.stop_btn.config(state="disabled")
-            self.local_url.config(text=f"http://localhost:{self.port}")
-            self.phone_url.config(text="")
-
-        def shutdown_server(self) -> None:
-            """Stop the server without touching a widget.
-
-            tkinter may only be driven from the thread that created the
-            window, so closing the app cannot do this on a worker.
-            """
-            if not self.server:
-                return
-            self.lines.put("Stopping...")
-            try:
-                self.server.shutdown()
-            finally:
-                self.server.server_close()
-                self.server = None
-
-        def quit(self) -> None:
-            self._closing = True
-            self.shutdown_server()
-            if self._saved_stdout is not None:
-                sys.stdout = self._saved_stdout
-            self.root.destroy()
-
-        def _set_status(self, text: str, running: bool) -> None:
-            self.status.config(
-                text=text, style="Pill.TLabel" if running else "PillOff.TLabel")
-
-        # ---- helpers ----
-
-        def toggle_pin(self) -> None:
-            self.pin_shown = not self.pin_shown
-            self.pin_var.set(PIN if self.pin_shown else self.pin_hidden)
-
-        def copy(self, text: str) -> None:
-            if not text:
-                return
-            self.root.clipboard_clear()
-            self.root.clipboard_append(text)
-            self.lines.put(f"Copied {text}")
-
-        def open_page(self, url: str) -> None:
-            if url and url.startswith("http"):
-                webbrowser.open(url)
-
-        def open_folder(self) -> None:
-            try:
-                DATA_DIR.mkdir(parents=True, exist_ok=True)
-                os.startfile(DATA_DIR)  # noqa: S606 - Windows only, by design
-            except (OSError, AttributeError) as exc:
-                self.lines.put(f"Could not open the folder: {exc}")
-
-        def _pump(self) -> None:
-            """Move queued log lines into the text box."""
-            if self._closing:
-                return
-            try:
-                while True:
-                    line = self.lines.get_nowait()
-                    self.log.config(state="normal")
-                    self.log.insert("end", line.rstrip() + "\n")
-                    self.log.see("end")
-                    self.log.config(state="disabled")
-            except queue.Empty:
-                pass
-            self.root.after(250, self._pump)
-
-    args = parse_args(argv)
-    App().root.mainloop()
+    # NOTE: webview.start() must be called on the main thread - the Windows
+    # EdgeChromium backend binds its message loop to it and simply dies on a
+    # worker. So the server is started first, on this thread, and the window
+    # runs afterwards; webview.start() blocks until the window closes.
+    if not _start_server():
+        show_error(lines.get() if not lines.empty() else "unknown error")
+        return 0
+    load_page()
+    try:
+        webview.create_window(
+            "pocket-share",
+            webview_window,
+            width=560, height=880, min_size=(420, 520),
+            frameless=False, easy_drag=False,
+            on_top=False, background_color="#f4f5f7")
+        webview.start()
+    except Exception as exc:  # backend problems must not vanish silently
+        show_error(str(exc))
+    finally:
+        _stop()
     return 0
 
 

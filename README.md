@@ -274,29 +274,35 @@ A quick way to try it before writing any app: run the script in **Termux**
 
 ## Building the .exe yourself
 
-PyInstaller is only needed to build, never to run — the resulting `.exe` is
-self-contained and needs no Python installed.
+Both tools are only needed to **build**. The resulting `.exe` needs neither
+Python nor a browser installed.
 
 ```
-pip install pyinstaller
-python -m PyInstaller --onefile --noconsole --name pocket-share teleport_share.py
+pip install pyinstaller pywebview
+python -m PyInstaller --onefile --noconsole --name pocket-share ^
+    --hidden-import webview teleport_share.py
 ```
 
-The result is `dist/pocket-share.exe` (~12 MB). Note **`--noconsole`**: without
-it the app is a console window full of logs rather than an application.
-`build/`, `dist/` and the generated `.spec` are gitignored.
+Result: `dist/pocket-share.exe` (~38 MB). Note **`--noconsole`** — without it
+you get a console window full of logs instead of an application.
 
-Run it from source either way:
+### How the window works
+
+The window **is** the web app. It embeds the same page the laptop and phone
+get, via `pywebview` driving the Edge WebView2 runtime that Windows already
+has. Nothing is reimplemented, so the two can't drift apart. The only addition
+is a thin bar at the top with **Start** and **Stop**.
+
+Because the UI lives in a webview, `pywebview` is the one build-time
+dependency that has no standard-library equivalent. `build/`, `dist/` and the
+generated `.spec` are gitignored.
+
+From source:
 
 ```
-python teleport_share.py            # text version
-python teleport_share.py --gui      # same window the .exe shows
+python teleport_share.py            # text version, no dependencies at all
+python teleport_share.py --gui      # the window (needs pywebview)
 ```
-
-The window shows both addresses with Open and Copy buttons, reveals the PIN on
-demand, opens the data folder, and streams live activity so you can see
-transfers happening. Stop and Start work, and closing the window stops the
-server.
 
 ## License
 
